@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Tuple
 
 import fire_uav.infrastructure.providers as deps
+from fire_uav.module_core.geometry import interpolate_path_point
+from fire_uav.module_core.route.python_planner import PythonRoutePlanner
+from fire_uav.module_core.schema import Route, TelemetrySample, Waypoint
 
 
 class PlannerVM:
@@ -13,6 +17,10 @@ class PlannerVM:
     MVVM-слой: хранит/отдаёт маршрут, импортирует GeoJSON LineString
     и экспортирует QGroundControl-совместимый mission.plan.
     """
+
+    def __init__(self) -> None:
+        self._route_planner: PythonRoutePlanner = PythonRoutePlanner()
+        self._path_backup: list[Tuple[float, float]] | None = None
 
     # ------------------------------------------------------------------ #
     #                     базовые set / get
@@ -22,9 +30,27 @@ class PlannerVM:
         deps.plan_data = {"path": pts}
         self.persist_plan()
 
+    def clear_plan(self) -> None:
+        """Очистить маршрут и удалить сохранённый артефакт."""
+        deps.plan_data = None
+        self._path_backup = None
+        self._delete_persisted_plan()
+
     def get_path(self) -> list[Tuple[float, float]]:
         """Вернуть текущий путь или [] если его ещё нет."""
         return (deps.plan_data or {}).get("path", [])
+
+    def get_active_path(self) -> list[Tuple[float, float]]:
+        """
+        Вернуть текущий активный путь:
+        - если есть построенный облет (debug_orbit_path) — показываем только его,
+        - иначе обычный маршрут.
+        """
+        if deps.rtl_path:
+            return deps.rtl_path
+        if deps.debug_target and deps.debug_orbit_path:
+            return deps.debug_orbit_path
+        return self.get_path()
 
     # ------------------------------------------------------------------ #
     #                       generate (по кнопке)
@@ -38,6 +64,113 @@ class PlannerVM:
         if not path:
             raise RuntimeError("Draw polyline first")
         return self.persist_plan()
+
+    # ------------------------------------------------------------------ #
+    #                    debug target / orbit preview
+    # ------------------------------------------------------------------ #
+    def set_debug_target(self, lat: float, lon: float) -> None:
+        """
+        Save a debug target (e.g. potential fire/human) for mid-flight maneuvers.
+        """
+        deps.debug_target = {"lat": lat, "lon": lon}
+
+    def clear_debug_target(self) -> None:
+        deps.debug_target = None
+        deps.debug_orbit_path = None
+        if self._path_backup:
+            self.save_plan(self._path_backup)
+        self._path_backup = None
+
+    def compute_orbit_preview(self) -> None:
+        """
+        Computes an orbit maneuver around the current debug_target using the last planned route.
+        """
+        if deps.debug_target is None:
+            return
+
+        base_path = self.get_path()
+        if not base_path:
+            return
+        if self._path_backup is None:
+            self._path_backup = list(base_path)
+        path = list(base_path)
+
+        default_alt = 120.0
+        current = self._current_position_on_path(path)
+        if current is None:
+            return
+        cur_lat, cur_lon = current
+        base_route = Route(
+            version=1,
+            waypoints=[Waypoint(lat=lat, lon=lon, alt=default_alt) for lat, lon in path],
+            active_index=self._nearest_index(path, current),
+        )
+
+        sim_sample = TelemetrySample(
+            lat=cur_lat,
+            lon=cur_lon,
+            alt=default_alt,
+            yaw=0.0,
+            battery=1.0,
+            battery_percent=100.0,
+            timestamp=datetime.utcnow(),
+        )
+
+        maneuver = self._route_planner.plan_maneuver(
+            current_state=sim_sample,
+            target_lat=deps.debug_target["lat"],
+            target_lon=deps.debug_target["lon"],
+            base_route=base_route,
+        )
+        if maneuver is None:
+            deps.debug_orbit_path = None
+            return
+
+        deps.debug_orbit_path = [(wp.lat, wp.lon) for wp in maneuver.waypoints]
+        if deps.debug_orbit_path:
+            self.save_plan(deps.debug_orbit_path)
+        self._persist_orbit_preview(deps.debug_orbit_path)
+
+    def rebuild_route_from_current_geom(self, geom_wkt: str | None = None) -> None:
+        """
+        Placeholder for future route regeneration based on geometry.
+        """
+        if self.get_path():
+            self.persist_plan()
+
+    def _persist_orbit_preview(self, pts: list[tuple[float, float]] | None) -> None:
+        """Persist orbit preview to artifacts for quick inspection while debugging."""
+        try:
+            root_dir = Path(__file__).resolve().parents[3]
+            artifacts = root_dir / "data" / "artifacts"
+            artifacts.mkdir(exist_ok=True)
+            fn = artifacts / "plan_orbit.json"
+            payload = {"orbit": pts or []}
+            fn.write_text(json.dumps(payload, indent=2))
+        except Exception:
+            pass
+
+    def _current_position_on_path(self, path: list[tuple[float, float]]) -> tuple[float, float] | None:
+        """Return current UAV position on path based on debug progress (0..1)."""
+        try:
+            return interpolate_path_point(path, getattr(deps, "debug_flight_progress", 0.0))  # type: ignore[arg-type]
+        except Exception:
+            return None
+
+    def _nearest_index(
+        self, path: list[tuple[float, float]], point: tuple[float, float]
+    ) -> int | None:
+        if not path:
+            return None
+        best_idx = 0
+        best_dist = float("inf")
+        lat0, lon0 = point
+        for idx, (lat, lon) in enumerate(path):
+            dist = (lat - lat0) ** 2 + (lon - lon0) ** 2
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        return best_idx
 
     # ------------------------------------------------------------------ #
     #                        IMPORT / EXPORT
@@ -66,6 +199,14 @@ class PlannerVM:
         fn = artifacts / "plan.json"
         fn.write_text(json.dumps(deps.plan_data or {}, indent=2))
         return fn
+
+    def _delete_persisted_plan(self) -> None:
+        fn = Path(__file__).resolve().parents[3] / "data" / "artifacts" / "plan.json"
+        try:
+            if fn.exists():
+                fn.unlink()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     #                QGroundControl mission.plan в artifacts/

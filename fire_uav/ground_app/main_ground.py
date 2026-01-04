@@ -25,11 +25,13 @@ except ImportError:
 import fire_uav.infrastructure.providers as deps
 from fire_uav.bootstrap import init_core
 from fire_uav.gui.windows.main_window import MainWindow
-from fire_uav.logging_setup import setup_logging
+from fire_uav.config.logging_config import setup_logging
+from fire_uav.ground_app.config import load_ground_settings
 
 
 def main() -> None:  # noqa: D401
-    setup_logging()
+    cfg = load_ground_settings()
+    setup_logging(cfg)
     init_core()  # создаёт очереди, lifecycle, bus-binding
 
     QtWebEngine.initialize()
@@ -50,4 +52,3 @@ def main() -> None:  # noqa: D401
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-

@@ -22,6 +22,16 @@ class Event(StrEnum):
     # управление
     APP_START = "app_start"
     APP_STOP = "app_stop"
+    MODULE_UNHEALTHY = "module_unhealthy"
+    BATTERY_CRITICAL = "battery_critical"
+    MISSION_STATE_CHANGED = "mission_state_changed"
+    UAV_LINK_STATUS_CHANGED = "uav_link_status_changed"
+    CAMERA_STATUS_CHANGED = "camera_status_changed"
+    CAPABILITIES_UPDATED = "capabilities_updated"
+    COMMAND_ACK = "command_ack"
+    WARNING_TOAST = "warning_toast"
+    FLIGHT_SESSION_STARTED = "flight_session_started"
+    FLIGHT_SESSION_ENDED = "flight_session_ended"
 
     # детектор
     DETECTION = "detection"

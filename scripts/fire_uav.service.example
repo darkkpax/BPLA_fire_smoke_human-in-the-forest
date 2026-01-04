@@ -1,0 +1,30 @@
+[Unit]
+Description=fire_uav module (containerized)
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Restart=always
+TimeoutStartSec=20
+Environment=FIRE_UAV_ROLE=module
+# Switch profile per device: jetson (GPU) or dev/demo/rockchip (CPU)
+Environment=FIRE_UAV_PROFILE=jetson
+# Uncomment for token-protected REST/health endpoints
+# Environment=FIRE_UAV_API_TOKEN=secret
+
+ExecStartPre=/usr/bin/docker rm -f fire-uav || true
+ExecStart=/usr/bin/docker run --name fire-uav \
+  --network host \
+  --ipc host \
+  # Uncomment on Jetson to use GPU via NVIDIA Container Runtime
+  # --runtime nvidia --gpus all \
+  --env FIRE_UAV_ROLE \
+  --env FIRE_UAV_PROFILE \
+  --env FIRE_UAV_API_TOKEN \
+  -v /var/lib/fire-uav/config:/app/fire_uav/config/user:ro \
+  -v /var/lib/fire-uav/data:/app/data \
+  fire-uav:arm64
+ExecStop=/usr/bin/docker stop fire-uav
+
+[Install]
+WantedBy=multi-user.target

@@ -97,14 +97,40 @@ def make_object(uav_id: str, obj: GeoDetection, status: str = "confirmed") -> di
     return msg.model_dump()
 
 
+class MapBounds(BaseModel):
+    lat_min: float
+    lon_min: float
+    lat_max: float
+    lon_max: float
+
+
+class MapSnapshotInfo(BaseModel):
+    uav_id: str
+    image_path: str
+    bounds: MapBounds
+    timestamp: datetime
+
+
+def make_map_snapshot_info(uav_id: str, image_path: str, bounds: MapBounds) -> MapSnapshotInfo:
+    """Build a MapSnapshotInfo with the current UTC timestamp."""
+    return MapSnapshotInfo(
+        uav_id=uav_id,
+        image_path=image_path,
+        bounds=bounds,
+        timestamp=datetime.utcnow(),
+    )
+
+
 __all__ = [
     "TelemetryMessage",
     "RouteMessage",
     "ObjectMessage",
     "AnyMessage",
     "Waypoint",
+    "MapBounds",
+    "MapSnapshotInfo",
     "make_telemetry",
     "make_route",
     "make_object",
+    "make_map_snapshot_info",
 ]
-

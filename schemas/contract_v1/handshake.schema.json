@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HandshakeV1",
+  "oneOf": [
+    { "$ref": "#/$defs/HandshakeRequestV1" },
+    { "$ref": "#/$defs/HandshakeResponseV1" }
+  ],
+  "$defs": {
+    "CapabilitiesV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supports_waypoints",
+        "supports_rtl",
+        "supports_orbit",
+        "supports_set_speed",
+        "supports_camera"
+      ],
+      "properties": {
+        "supports_waypoints": { "type": "boolean" },
+        "supports_rtl": { "type": "boolean" },
+        "supports_orbit": { "type": "boolean" },
+        "supports_set_speed": { "type": "boolean" },
+        "supports_camera": { "type": "boolean" },
+        "max_waypoints": { "type": ["integer", "null"] },
+        "notes": { "type": ["string", "null"] }
+      }
+    },
+    "HandshakeRequestV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uav_id", "client_type"],
+      "properties": {
+        "uav_id": { "type": "string" },
+        "client_type": { "type": "string", "enum": ["unreal", "drone_bridge", "client_software"] },
+        "client_version": { "type": ["string", "null"] },
+        "capabilities": { "$ref": "#/$defs/CapabilitiesV1" }
+      }
+    },
+    "HandshakeResponseV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "protocol_version",
+        "server_time",
+        "required_fields",
+        "assigned_uav_id"
+      ],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "protocol_version": { "type": "integer", "const": 1 },
+        "server_time": { "type": "string", "format": "date-time" },
+        "required_fields": { "type": "object" },
+        "assigned_uav_id": { "type": "string" },
+        "notes": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

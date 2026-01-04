@@ -23,8 +23,3 @@ __all__ = (
     "FlightPlanner",
     "EnergyModel",
 )
-
-# ── logging: сразу на старте отправляем всё в artifacts/logs/ -------------
-from fire_uav.logging_setup import setup_logging
-
-setup_logging()  # создаёт каталоги и вешает FileHandler

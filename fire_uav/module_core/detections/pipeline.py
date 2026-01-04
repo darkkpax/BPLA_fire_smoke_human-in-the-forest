@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import logging
 import asyncio
+import logging
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import List, Sequence, Tuple
+from typing import Callable, List, Sequence, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -59,6 +59,7 @@ class DetectionPipeline:
         camera_params: CameraParams | None = None,
         visualizer_adapter=None,
         loop=None,
+        detection_callback: Callable[[datetime], None] | None = None,
     ) -> None:
         self.aggregator = aggregator or DetectionAggregator(
             window=settings.agg_window,
@@ -82,6 +83,7 @@ class DetectionPipeline:
         self._lock = Lock()
         self._visualizer = visualizer_adapter
         self._loop = loop
+        self._detection_callback = detection_callback
 
     def process_batch(self, payload: DetectionBatchPayload) -> List[GeoDetection]:
         if not payload.detections:
@@ -118,6 +120,8 @@ class DetectionPipeline:
             for det in aggregated:
                 self._notification_manager.handle_confirmed_detection(det)
                 self._publish_visualizer(det)
+            if self._detection_callback:
+                self._detection_callback(aggregated[-1].timestamp or datetime.utcnow())
         self._transmit(aggregated)
         return aggregated
 

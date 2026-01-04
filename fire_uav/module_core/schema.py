@@ -33,6 +33,9 @@ class TelemetrySample(BaseModel):
     vy: float | None = None
     vz: float | None = None
     battery: float = Field(1.0, ge=0.0, le=1.0, description="Remaining battery, 0..1")
+    battery_percent: float | None = Field(
+        default=None, ge=0.0, le=100.0, description="Remaining battery, 0..100 (%)"
+    )
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     source: str | None = Field(
         default=None,

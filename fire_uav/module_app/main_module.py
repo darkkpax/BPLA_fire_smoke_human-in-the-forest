@@ -3,27 +3,31 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+from datetime import datetime
+
+import uvicorn
 
 from fire_uav.bootstrap import init_core
-from fire_uav.logging_setup import setup_logging
+from fire_uav.config.logging_config import setup_logging
 from fire_uav.module_app.config import load_module_settings
-from fire_uav.module_core.adapters import (
-    CustomSdkUavAdapter,
-    IUavAdapter,
-    IUavTelemetryConsumer,
-    MavlinkUavAdapter,
-    UnrealSimUavAdapter,
-)
+from fire_uav.module_app.health_api import app as health_app, configure_health, health_state
+from fire_uav.core.telemetry import coerce_battery_percent
+from fire_uav.module_core.adapters import IUavAdapter, IUavTelemetryConsumer
+from fire_uav.module_core.drivers.registry import create_driver
 from fire_uav.module_core.detections import DetectionAggregator, DetectionPipeline
 from fire_uav.module_core.factories import get_energy_model, get_geo_projector
+from fire_uav.module_core.interfaces.energy import IEnergyModel
 from fire_uav.module_core.route.python_planner import PythonRoutePlanner
-from fire_uav.module_core.schema import TelemetrySample
+from fire_uav.module_core.schema import Route, TelemetrySample, Waypoint
 from fire_uav.services.bus import Event, bus
 from fire_uav.services.visualizer_adapter import VisualizerAdapter
 from fire_uav.services.telemetry.transmitter import Transmitter
+from fire_uav.services.telemetry_ingest import TelemetryIngestContext, ingest_telemetry
 
 log = logging.getLogger(__name__)
+_health_server: uvicorn.Server | None = None
 
 
 class _ModuleTelemetryConsumer(IUavTelemetryConsumer):
@@ -34,19 +38,51 @@ class _ModuleTelemetryConsumer(IUavTelemetryConsumer):
         *,
         pipeline: DetectionPipeline,
         planner: PythonRoutePlanner,
-        energy_model: PythonEnergyModel,
+        energy_model: IEnergyModel,
         visualizer: VisualizerAdapter | None,
+        adapter: IUavAdapter,
+        settings,
     ) -> None:
         self.pipeline = pipeline
         self.planner = planner
         self.energy_model = energy_model
         self.latest: TelemetrySample | None = None
         self.visualizer = visualizer
+        self.adapter = adapter
+        self.settings = settings
+        self._emergency_active = False
+        self._base_warned = False
+        self._ingest_context = TelemetryIngestContext(
+            planner=planner,
+            health_state_updater=health_state.update_telemetry,
+            visualizer=visualizer,
+        )
+
+    def _resolve_base_location(self, sample: TelemetrySample) -> tuple[float, float]:
+        for lat_key, lon_key in (("home_lat", "home_lon"), ("base_lat", "base_lon")):
+            lat = getattr(self.settings, lat_key, None)
+            lon = getattr(self.settings, lon_key, None)
+            if lat is not None and lon is not None:
+                try:
+                    return float(lat), float(lon)
+                except (TypeError, ValueError):
+                    pass
+
+        center = getattr(self.settings, "map_center", None)
+        if isinstance(center, (list, tuple)) and len(center) >= 2:
+            try:
+                return float(center[0]), float(center[1])
+            except (TypeError, ValueError):
+                pass
+
+        if not self._base_warned:
+            log.warning("Base location unavailable; falling back to current telemetry position.")
+            self._base_warned = True
+        return sample.lat, sample.lon
 
     async def on_telemetry(self, sample: TelemetrySample) -> None:
         self.latest = sample
-        if self.visualizer:
-            await self.visualizer.publish_telemetry(sample)
+        await ingest_telemetry(sample, context=self._ingest_context)
         log.debug(
             "Telemetry update: lat=%.6f lon=%.6f alt=%.1f batt=%.2f",
             sample.lat,
@@ -54,6 +90,31 @@ class _ModuleTelemetryConsumer(IUavTelemetryConsumer):
             sample.alt,
             sample.battery,
         )
+
+        battery_percent = coerce_battery_percent(sample.battery, sample.battery_percent)
+        critical_threshold = getattr(self.settings, "critical_battery_percent", 10.0)
+        if battery_percent is None or battery_percent > critical_threshold:
+            return
+        if self._emergency_active:
+            return
+
+        base_lat, base_lon = self._resolve_base_location(sample)
+        return_route = Route(
+            version=1,
+            waypoints=[
+                Waypoint(lat=sample.lat, lon=sample.lon, alt=sample.alt),
+                Waypoint(lat=base_lat, lon=base_lon, alt=sample.alt),
+            ],
+            active_index=0,
+        )
+        self._emergency_active = True
+        log.warning(
+            "Critical battery detected (%.1f%% <= %.1f%%). Sending return-to-base route.",
+            battery_percent,
+            critical_threshold,
+        )
+        bus.emit(Event.BATTERY_CRITICAL, {"battery_percent": battery_percent})
+        await self.adapter.push_route(return_route)
 
 
 def _make_transmitter() -> Transmitter | None:
@@ -72,20 +133,64 @@ def _make_transmitter() -> Transmitter | None:
 
 
 def _build_adapter(cfg) -> IUavAdapter:
-    backend = (getattr(cfg, "uav_backend", "") or "mavlink").lower()
-    if backend == "mavlink":
-        return MavlinkUavAdapter(cfg.mavlink_connection_string, logger=log)
-    if backend == "unreal":
-        return UnrealSimUavAdapter(cfg.unreal_base_url, logger=log)
-    if backend == "custom":
-        return CustomSdkUavAdapter(cfg.custom_sdk_config, logger=log)
-    raise ValueError(f"Unknown uav_backend: {cfg.uav_backend}")
+    return create_driver(cfg, logger=log)
+
+
+async def _run_health_server(cfg) -> None:
+    """Run a lightweight uvicorn server for the health endpoint (option 1)."""
+    global _health_server
+    config = uvicorn.Config(
+        health_app,
+        host=cfg.health_host,
+        port=cfg.health_port,
+        log_level="warning",
+        loop="asyncio",
+    )
+    server = uvicorn.Server(config)
+    _health_server = server
+    await server.serve()
+
+
+async def _watchdog_loop(cfg) -> None:
+    """Periodic watchdog that checks telemetry and detections recency."""
+    telemetry_flagged = False
+    detection_flagged = False
+    while True:
+        await asyncio.sleep(cfg.watchdog_interval_sec)
+        now = datetime.utcnow()
+        last_tel = health_state.last_telemetry
+        if last_tel is None or (now - last_tel).total_seconds() > cfg.no_telemetry_timeout_sec:
+            if not telemetry_flagged:
+                log.error(
+                    "Watchdog: no telemetry for > %.1fs", cfg.no_telemetry_timeout_sec
+                )
+                health_state.mark_unhealthy("telemetry_stale")
+                bus.emit(Event.MODULE_UNHEALTHY, {"reason": "telemetry"})
+                telemetry_flagged = True
+        else:
+            telemetry_flagged = False
+            health_state.clear_reason("telemetry_stale")
+
+        if getattr(cfg, "watchdog_expect_detections", False):
+            last_det = health_state.last_detection
+            if last_det is None or (now - last_det).total_seconds() > cfg.no_detection_timeout_sec:
+                if not detection_flagged:
+                    log.warning(
+                        "Watchdog: no detections for > %.1fs", cfg.no_detection_timeout_sec
+                    )
+                    detection_flagged = True
+            else:
+                detection_flagged = False
+                health_state.clear_reason("detections_stale")
 
 
 async def _run() -> None:
     """Configure shared services and start headless processing loop."""
-    setup_logging()
     cfg = load_module_settings()
+    setup_logging(cfg)
+    loop = asyncio.get_running_loop()
+    health_server: asyncio.Task | None = None
+    watchdog: asyncio.Task | None = None
 
     init_core()  # queues + lifecycle; camera/detector threads if camera present
 
@@ -107,6 +212,7 @@ async def _run() -> None:
         transmitter=transmitter,
         visualizer_adapter=visualizer if getattr(cfg, "visualizer_enabled", False) else None,
         loop=loop,
+        detection_callback=health_state.update_detection,
     )
 
     adapter = _build_adapter(cfg)
@@ -115,6 +221,8 @@ async def _run() -> None:
         planner=planner,
         energy_model=energy_model,
         visualizer=visualizer if getattr(cfg, "visualizer_enabled", False) else None,
+        adapter=adapter,
+        settings=cfg,
     )
 
     log.info(
@@ -130,6 +238,16 @@ async def _run() -> None:
     bus.emit(Event.APP_START)
     log.info("Started core lifecycle threads")
 
+    health_state.mark_start()
+    configure_health(
+        telemetry_timeout_sec=cfg.no_telemetry_timeout_sec,
+        detection_timeout_sec=cfg.no_detection_timeout_sec,
+        expect_detections=getattr(cfg, "watchdog_expect_detections", False),
+    )
+
+    health_server = asyncio.create_task(_run_health_server(cfg))
+    watchdog = asyncio.create_task(_watchdog_loop(cfg))
+
     await adapter.start(telemetry_consumer)
     log.info("UAV adapter started (%s)", adapter.__class__.__name__)
 
@@ -140,6 +258,10 @@ async def _run() -> None:
         log.info("Stopping module runtime...")
     finally:
         bus.emit(Event.APP_STOP)
+        if watchdog:
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog
         try:
             await adapter.stop()
         except Exception:  # noqa: BLE001
@@ -154,6 +276,11 @@ async def _run() -> None:
                 await visualizer.aclose()
             except Exception:  # noqa: BLE001
                 log.exception("Failed to close visualizer adapter")
+        if _health_server:
+            _health_server.should_exit = True
+        if health_server:
+            with contextlib.suppress(asyncio.CancelledError):
+                await health_server
 
 
 def main() -> None:

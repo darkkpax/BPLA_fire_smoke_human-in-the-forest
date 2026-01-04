@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RouteV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "uav_id",
+    "route_id",
+    "waypoints",
+    "mode",
+    "created_at"
+  ],
+  "properties": {
+    "protocol_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "uav_id": {
+      "type": "string"
+    },
+    "route_id": {
+      "type": "string"
+    },
+    "waypoints": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/WaypointV1" }
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["MISSION", "ORBIT", "RTL"]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "WaypointV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lat", "lon", "alt"],
+      "properties": {
+        "lat": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90
+        },
+        "lon": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180
+        },
+        "alt": {
+          "type": "number"
+        },
+        "speed_mps": {
+          "type": ["number", "null"]
+        },
+        "loiter_radius_m": {
+          "type": ["number", "null"]
+        },
+        "action": {
+          "type": ["string", "null"]
+        }
+      }
+    }
+  }
+}

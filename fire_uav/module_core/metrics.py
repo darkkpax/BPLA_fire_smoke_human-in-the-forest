@@ -1,4 +1,4 @@
-from prometheus_client import REGISTRY, Gauge, Histogram
+from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 
 # Camera / detector
 fps_gauge = Gauge("camera_fps", "Frames per second from camera")
@@ -12,10 +12,24 @@ queue_size = Gauge("detector_queue_size", "Items in detection queue")
 # Planner
 coverage_percent = Gauge("coverage_percent", "Planner coverage %")
 
+# Telemetry ingestion
+telemetry_ingest_total = Counter(
+    "telemetry_ingest_total",
+    "Telemetry samples ingested",
+    ["source"],
+)
+telemetry_ingest_errors_total = Counter(
+    "telemetry_ingest_errors_total",
+    "Telemetry samples rejected or failed to parse",
+    ["source"],
+)
+
 __all__ = [
     "fps_gauge",
     "detect_latency",
     "queue_size",
     "coverage_percent",
+    "telemetry_ingest_total",
+    "telemetry_ingest_errors_total",
     "REGISTRY",
 ]

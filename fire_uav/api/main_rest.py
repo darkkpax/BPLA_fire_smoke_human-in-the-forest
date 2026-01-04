@@ -8,13 +8,17 @@ from __future__ import annotations
 import logging
 from typing import Any, List
 
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Response, status
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import ORJSONResponse
 from prometheus_client import REGISTRY, generate_latest
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 
 import fire_uav.infrastructure.providers as deps
 from fire_uav.bootstrap import init_core
 from fire_uav.config import settings
+from fire_uav.api.security import require_api_key
 from fire_uav.module_core.schema import GeoDetection
 from fire_uav.services.bus import Event, bus
 from fire_uav.services.detections import DetectionBatchPayload, DetectionPipeline
@@ -24,7 +28,16 @@ from fire_uav.services.telemetry.transmitter import Transmitter
 init_core()
 
 log = logging.getLogger("api")
-app = FastAPI(title="fire-uav API", version="0.1.0")
+app = FastAPI(
+    title="fire-uav API",
+    version="0.1.0",
+    default_response_class=ORJSONResponse,
+    dependencies=[Depends(require_api_key)],
+)
+app.add_middleware(GZipMiddleware, minimum_size=512)
+
+# Expose HTTP metrics separately to avoid clashing with the legacy /metrics endpoint.
+Instrumentator().instrument(app).expose(app, endpoint="/metrics/http")
 
 _transmitter: Transmitter | None = None
 if settings.ground_station_enabled:

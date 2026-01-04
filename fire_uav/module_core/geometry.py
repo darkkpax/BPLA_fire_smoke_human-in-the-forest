@@ -26,3 +26,41 @@ def offset_latlon(lat: float, lon: float, dx_m: float, dy_m: float) -> Tuple[flo
     d_lat = dy_m / EARTH_RADIUS_M
     d_lon = dx_m / (EARTH_RADIUS_M * math.cos(math.radians(lat)))
     return lat + math.degrees(d_lat), lon + math.degrees(d_lon)
+
+
+def interpolate_path_point(
+    path: list[Tuple[float, float]], progress: float
+) -> Tuple[float, float] | None:
+    """
+    Return a point along the path for a given progress in [0, 1].
+    Linear interpolation by segment length; returns the last point if progress >= 1.
+    """
+    if not path:
+        return None
+    if len(path) == 1:
+        return path[0]
+
+    progress = max(0.0, min(1.0, float(progress)))
+    segments: list[float] = []
+    total = 0.0
+    for a, b in zip(path[:-1], path[1:]):
+        dist = haversine_m(a, b)
+        segments.append(dist)
+        total += dist
+
+    if total == 0:
+        return path[-1]
+
+    target = total * progress
+    acc = 0.0
+    for (lat1, lon1), (lat2, lon2), seg_len in zip(path[:-1], path[1:], segments):
+        if acc + seg_len >= target:
+            if seg_len == 0:
+                return lat2, lon2
+            ratio = (target - acc) / seg_len
+            lat = lat1 + (lat2 - lat1) * ratio
+            lon = lon1 + (lon2 - lon1) * ratio
+            return lat, lon
+        acc += seg_len
+
+    return path[-1]

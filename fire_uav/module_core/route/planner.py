@@ -18,15 +18,15 @@ from fire_uav.module_core.geometry import haversine_m
 from fire_uav.module_core.route.energy import EnergyModel
 from fire_uav.module_core.route.no_fly import load_no_fly
 from fire_uav.module_core.schema import Waypoint as WaypointModel
-from fire_uav.module_core.settings_loader import load_settings
+from fire_uav.config import settings as app_settings
 
-# ← читаем настройки единожды
-settings = load_settings()
+DEFAULT_SETTINGS = app_settings
 
 try:
     from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-except ImportError as e:
-    raise RuntimeError("Install `ortools` to use FlightPlanner") from e
+    ORTOOLS_AVAILABLE = True
+except ImportError:
+    ORTOOLS_AVAILABLE = False
 
 _log = logging.getLogger(__name__)
 
@@ -66,9 +66,11 @@ class FlightPlanner:
         cam: CameraSpec | None = None,
         grid: GridParams | None = None,
         energy: EnergyModel | None = None,
+        settings=DEFAULT_SETTINGS,
     ):
+        self._settings = settings or DEFAULT_SETTINGS
         # вычитаем запретные зоны
-        nfz = load_no_fly(settings.get("no_fly_geojson", ""))
+        nfz = load_no_fly(getattr(self._settings, "no_fly_geojson", ""))
         if nfz:
             aoi = aoi.difference(nfz)
 
@@ -161,6 +163,14 @@ class FlightPlanner:
         if n <= 3:
             return wps
 
+        use_ortools_cfg = bool(getattr(self._settings, "use_ortools", True))
+        if not ORTOOLS_AVAILABLE or not use_ortools_cfg:
+            if not ORTOOLS_AVAILABLE:
+                _log.warning("ortools not available, using simple sequential route (no TSP optimization).")
+            else:
+                _log.info("use_ortools is False; skipping TSP optimization and keeping sequential route.")
+            return wps
+
         # матрица расстояний
         dist = [[0] * n for _ in range(n)]
         for i in range(n):
@@ -227,7 +237,7 @@ class FlightPlanner:
 WaypointT = Tuple[float, float, float]  # lat, lon, alt
 
 
-def build_route(geom_wkt: str, gsd_cm: int = 0) -> List[List[WaypointT]]:
+def build_route(geom_wkt: str, gsd_cm: int = 0, settings=DEFAULT_SETTINGS) -> List[List[WaypointT]]:
     """
     Принимает WKT-строку:
 
@@ -248,8 +258,13 @@ def build_route(geom_wkt: str, gsd_cm: int = 0) -> List[List[WaypointT]]:
             return [[(lat, lon, 120.0) for lat, lon in path_latlon]]
 
     if geom.geom_type == "Polygon":
-        grid = GridParams(gsd_target_cm=gsd_cm) if gsd_cm else None
-        fp = FlightPlanner(geom, grid=grid)
+        effective_gsd = gsd_cm or int(getattr(settings, "gsd_cm", 0) or 0)
+        grid = GridParams(
+            gsd_target_cm=effective_gsd or GridParams().gsd_target_cm,
+            side_overlap=float(getattr(settings, "side_overlap", GridParams().side_overlap)),
+            front_overlap=float(getattr(settings, "front_overlap", GridParams().front_overlap)),
+        )
+        fp = FlightPlanner(geom, grid=grid, settings=settings)
         missions = fp.generate()  # list[list[Waypoint]]
         return [[(wp.lat, wp.lon, wp.alt) for wp in ms] for ms in missions]
 

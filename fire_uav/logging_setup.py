@@ -8,30 +8,15 @@
 
 from __future__ import annotations
 
-import logging.config
-from pathlib import Path
+import logging
 
-import yaml
+from fire_uav.config.logging_config import setup_logging as _setup_logging
+from fire_uav.config.settings import settings
 
 
-def setup_logging() -> None:
+def setup_logging(custom_settings=None) -> None:
     """
-    Загружает YAML-конфиг и настраивает logging.config.dictConfig.
+    Backwards-compatible wrapper that configures logging using Settings.
     """
-    # ── 1. Читаем YAML
-    cfg_file = Path(__file__).resolve().parents[1] / "fire_uav" / "config" / "logging.yaml"
-    with cfg_file.open(encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    # ── 2. Готовим каталог для логов
-    root_dir = Path(__file__).resolve().parents[1]
-    log_dir = root_dir / "data" / "artifacts" / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    # ── 3. Подменяем путь у file-handler’а
-    handler = cfg["handlers"].get("debug-file")
-    if handler:
-        handler["filename"] = str(log_dir / "fire_uav_debug.log")
-
-    # ── 4. Активируем конфигурацию
-    logging.config.dictConfig(cfg)
+    cfg = custom_settings or settings
+    _setup_logging(cfg)

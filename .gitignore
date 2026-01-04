@@ -1,0 +1,61 @@
+# OS / editors
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.bak
+.idea/
+.vscode/
+.ipynb_checkpoints/
+
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Dependencies / builds
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Logs and temp
+*.log
+*.log.*
+*.tmp
+*.temp
+
+# Testing / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.nox/
+.tox/
+.coverage
+.coverage.*
+.dmypy.json
+.cache/
+htmlcov/
+
+# Environment files
+.env
+*.env
+
+# Project data outputs (runtime artifacts)
+data/outputs/
+data/logs/
+data/notifications/
+data/tmp/
+data/artifacts/logs/
+
+# Qt / PySide generated cache
+fire_uav/gui/qml/*.qmlc
+fire_uav/gui/qml/*.jsc

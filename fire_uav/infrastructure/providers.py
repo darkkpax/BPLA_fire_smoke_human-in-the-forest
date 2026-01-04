@@ -25,6 +25,20 @@ lifecycle_manager: "LifecycleManager | None" = None
 plan_data: Any | None = None  # хранит JSON-план (List[waypoints])
 last_detection: Any | None = None  # последняя пачка детекций
 
+# ────────── GUI/debug-only shared state ────────── #
+# Используется только визуальными отладочными функциями (маршрут/орбита) и
+# не затрагивает пайплайн детекции.
+debug_target: dict | None = None  # {"lat": float, "lon": float}
+debug_orbit_path: list[tuple[float, float]] | None = None  # [(lat, lon), ...]
+debug_flight_enabled: bool = False  # флаг режима "flight debug" в GUI
+debug_flight_progress: float = 0.0  # положение 0..1 по маршруту для псевдо-полёта
+debug_map_manual_refresh: bool = False  # вручную обновляем позицию дрона на карте
+rtl_path: list[tuple[float, float]] | None = None  # RTL path override for map display
+confirmed_objects: list[dict] = []  # cached confirmed objects for map overlays
+selected_object_id: str | None = None  # selected confirmed object for orbit actions
+latest_telemetry: Any | None = None  # last telemetry sample for map/status
+route_stats: dict | None = None  # cached route battery stats for map overlays
+
 
 # ────────── helpers ────────── #
 def get_camera() -> "CameraThread":

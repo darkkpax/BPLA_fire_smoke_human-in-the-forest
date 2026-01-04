@@ -5,22 +5,27 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List, Literal
 
-from fire_uav.module_core.settings_loader import Settings as _SettingsDict, load_settings
+from fire_uav.module_core.settings_loader import Settings as _SettingsDict, load_settings as _load_settings
+from fire_uav.core.protocol import MapBounds
 
 
 @dataclass
 class Settings:
     # Runtime role/adapter
-    role: str = "module"
-    uav_backend: str = "mavlink"
+    profile: Literal["dev", "demo", "jetson"] = "dev"
+    role: str = "ground"
+    uav_backend: str = "stub"
+    driver_type: str = ""
     mavlink_connection_string: str = "udp:127.0.0.1:14550"
     unreal_base_url: str = "http://127.0.0.1:9000"
     custom_sdk_config: dict = field(default_factory=dict)
     use_native_core: bool = False
+    use_ortools: bool = True
     uav_id: str | None = None
     notifications_dir: Path = Path("data/notifications")
     bbox_smooth_alpha: float = 0.5
@@ -32,6 +37,17 @@ class Settings:
     track_max_center_distance_px: float = 80.0
     visualizer_enabled: bool = False
     visualizer_url: str = "http://127.0.0.1:8000"
+    log_level: str = "INFO"
+    log_to_file: bool = False
+    log_file: Path = Path("data/logs/fire_uav.log")
+    log_max_bytes: int = 5_000_000
+    log_backup_count: int = 3
+    health_host: str = "127.0.0.1"
+    health_port: int = 8079
+    watchdog_interval_sec: float = 5.0
+    no_telemetry_timeout_sec: float = 10.0
+    no_detection_timeout_sec: float = 60.0
+    watchdog_expect_detections: bool = False
 
     # Параметры YOLO
     yolo_model: str = "yolov11n.pt"
@@ -56,20 +72,44 @@ class Settings:
     agg_ttl_seconds: float = 8.0
 
     # ------------------------ #
+    map_provider: str = "openlayers_de"
+    static_map_image_path: str | None = None
+    static_map_bounds: dict | None = None
+    map_center: list[float] | None = None
+    gsd_cm: float = 3.0
+    side_overlap: float = 0.7
+    front_overlap: float = 0.8
+    battery_wh: float = 4500.0
+    no_fly_geojson: str = "data/no_fly_zones.geojson"
+    max_flight_distance_m: float = 15000.0
+    min_return_percent: float = 20.0
+    critical_battery_percent: float = 10.0
 
     @classmethod
     def from_dict(cls, data: _SettingsDict) -> "Settings":
         """Собрать объект настроек из dict (например, из JSON-файла)."""
         defaults = cls()
+        bounds_raw = data.get("static_map_bounds", defaults.static_map_bounds)
+        static_bounds = None
+        if isinstance(bounds_raw, MapBounds):
+            static_bounds = bounds_raw.model_dump()
+        elif isinstance(bounds_raw, dict):
+            try:
+                static_bounds = MapBounds(**bounds_raw).model_dump()
+            except Exception:
+                static_bounds = None
         return cls(
+            profile=data.get("profile", defaults.profile),
             role=data.get("role", defaults.role),
             uav_backend=data.get("uav_backend", defaults.uav_backend),
+            driver_type=data.get("driver_type", defaults.driver_type),
             mavlink_connection_string=data.get(
                 "mavlink_connection_string", defaults.mavlink_connection_string
             ),
             unreal_base_url=data.get("unreal_base_url", defaults.unreal_base_url),
             custom_sdk_config=data.get("custom_sdk_config", defaults.custom_sdk_config),
             use_native_core=bool(data.get("use_native_core", defaults.use_native_core)),
+            use_ortools=bool(data.get("use_ortools", defaults.use_ortools)),
             uav_id=data.get("uav_id", defaults.uav_id),
             notifications_dir=Path(data.get("notifications_dir", defaults.notifications_dir)),
             bbox_smooth_alpha=float(data.get("bbox_smooth_alpha", defaults.bbox_smooth_alpha)),
@@ -87,6 +127,25 @@ class Settings:
             ),
             visualizer_enabled=bool(data.get("visualizer_enabled", defaults.visualizer_enabled)),
             visualizer_url=data.get("visualizer_url", defaults.visualizer_url),
+            log_level=data.get("log_level", defaults.log_level),
+            log_to_file=bool(data.get("log_to_file", defaults.log_to_file)),
+            log_file=Path(data.get("log_file", defaults.log_file)),
+            log_max_bytes=int(data.get("log_max_bytes", defaults.log_max_bytes)),
+            log_backup_count=int(data.get("log_backup_count", defaults.log_backup_count)),
+            health_host=data.get("health_host", defaults.health_host),
+            health_port=int(data.get("health_port", defaults.health_port)),
+            watchdog_interval_sec=float(
+                data.get("watchdog_interval_sec", defaults.watchdog_interval_sec)
+            ),
+            no_telemetry_timeout_sec=float(
+                data.get("no_telemetry_timeout_sec", defaults.no_telemetry_timeout_sec)
+            ),
+            no_detection_timeout_sec=float(
+                data.get("no_detection_timeout_sec", defaults.no_detection_timeout_sec)
+            ),
+            watchdog_expect_detections=bool(
+                data.get("watchdog_expect_detections", defaults.watchdog_expect_detections)
+            ),
             yolo_model=data.get("yolo_model", defaults.yolo_model),
             yolo_conf=float(data.get("yolo_conf", defaults.yolo_conf)),
             yolo_iou=float(data.get("yolo_iou", defaults.yolo_iou)),
@@ -103,9 +162,46 @@ class Settings:
             agg_min_confidence=float(data.get("agg_min_confidence", defaults.agg_min_confidence)),
             agg_max_distance_m=float(data.get("agg_max_distance_m", defaults.agg_max_distance_m)),
             agg_ttl_seconds=float(data.get("agg_ttl_seconds", defaults.agg_ttl_seconds)),
+            map_provider=str(data.get("map_provider", defaults.map_provider)),
+            static_map_image_path=data.get("static_map_image_path", defaults.static_map_image_path),
+            static_map_bounds=static_bounds,
+            map_center=data.get("map_center", defaults.map_center),
+            gsd_cm=float(data.get("gsd_cm", defaults.gsd_cm)),
+            side_overlap=float(data.get("side_overlap", defaults.side_overlap)),
+            front_overlap=float(data.get("front_overlap", defaults.front_overlap)),
+            battery_wh=float(data.get("battery_wh", defaults.battery_wh)),
+            no_fly_geojson=str(data.get("no_fly_geojson", defaults.no_fly_geojson)),
+            max_flight_distance_m=float(
+                data.get("max_flight_distance_m", defaults.max_flight_distance_m)
+            ),
+            min_return_percent=float(data.get("min_return_percent", defaults.min_return_percent)),
+            critical_battery_percent=float(
+                data.get("critical_battery_percent", defaults.critical_battery_percent)
+            ),
         )
 
 
-settings = Settings.from_dict(load_settings())
+def _apply_profile_overrides(data: Dict[str, Any], profile: str) -> Dict[str, Any]:
+    """Apply profile-specific defaults unless explicitly overridden."""
+    profile = profile.lower()
+    overrides: Dict[str, Dict[str, Any]] = {
+        "dev": {"log_level": "DEBUG", "visualizer_enabled": True},
+        "demo": {"log_level": "INFO", "visualizer_enabled": True},
+        "jetson": {"log_level": "INFO", "visualizer_enabled": False, "use_native_core": True},
+    }
+    for key, value in overrides.get(profile, {}).items():
+        data.setdefault(key, value)
+    return data
 
-__all__ = ["Settings", "settings"]
+
+def load_settings() -> Settings:
+    raw = _load_settings()
+    profile = str(os.environ.get("FIRE_UAV_PROFILE", raw.get("profile", "dev"))).lower()
+    raw["profile"] = profile
+    raw = _apply_profile_overrides(raw, profile)
+    return Settings.from_dict(raw)
+
+
+settings = load_settings()
+
+__all__ = ["Settings", "settings", "load_settings"]

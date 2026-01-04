@@ -27,13 +27,20 @@ def get_geo_projector(settings) -> IGeoProjector:  # noqa: ANN001
 def get_energy_model(settings) -> IEnergyModel:  # noqa: ANN001
     if getattr(settings, "use_native_core", False) and NATIVE_AVAILABLE:
         log.info("Native core enabled for energy.")
-        return NativeEnergyModel()
+        return NativeEnergyModel(
+            max_flight_distance_m=getattr(settings, "max_flight_distance_m", 15000.0),
+            min_return_percent=getattr(settings, "min_return_percent", 20.0),
+            critical_battery_percent=getattr(settings, "critical_battery_percent", 10.0),
+        )
     if getattr(settings, "use_native_core", False) and not NATIVE_AVAILABLE:
         log.warning("Native core requested but unavailable, falling back to PythonEnergyModel.")
     else:
         log.info("Using PythonEnergyModel (native disabled).")
-    return PythonEnergyModel()
+    return PythonEnergyModel(
+        max_flight_distance_m=getattr(settings, "max_flight_distance_m", 15000.0),
+        min_return_percent=getattr(settings, "min_return_percent", 20.0),
+        critical_battery_percent=getattr(settings, "critical_battery_percent", 10.0),
+    )
 
 
 __all__ = ["get_geo_projector", "get_energy_model"]
-

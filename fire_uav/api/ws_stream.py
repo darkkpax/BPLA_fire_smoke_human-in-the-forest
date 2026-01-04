@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from fire_uav.api.security import require_ws_api_key
 from fire_uav.api.visualizer_api import app, last_objects, last_route, last_telemetry
 
 
@@ -17,6 +19,8 @@ async def stream_state(ws: WebSocket) -> None:
     Query params:
       - uav_id: optional; if provided only that UAV's state is streamed.
     """
+    if not await require_ws_api_key(ws):
+        return
     await ws.accept()
     params = ws.query_params
     uav_id = params.get("uav_id")
@@ -36,11 +40,21 @@ async def stream_state(ws: WebSocket) -> None:
                         "route": last_route.get(uid),
                         "objects": list(last_objects.get(uid, {}).values()),
                     }
-            await ws.send_text(json.dumps(payload, default=lambda o: getattr(o, "model_dump", lambda: o)()))
+            await ws.send_text(json.dumps(payload, default=_json_default))
             await asyncio.sleep(0.1)
     except WebSocketDisconnect:
         return
 
 
-__all__ = ["app"]
+def _json_default(obj: Any) -> Any:
+    if hasattr(obj, "model_dump"):
+        try:
+            return obj.model_dump(mode="json")
+        except TypeError:
+            return obj.model_dump()
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    return str(obj)
 
+
+__all__ = ["app"]

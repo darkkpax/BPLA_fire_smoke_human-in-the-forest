@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import os
 
+from fire_uav.config.settings import load_settings
+
 ROLE_ENV = "FIRE_UAV_ROLE"
 
 
 def _is_module_role() -> bool:
-    role = os.environ.get(ROLE_ENV, "ground").lower()
-    return role.startswith("module")
+    role_env = os.environ.get(ROLE_ENV)
+    if role_env:
+        return role_env.lower().startswith("module")
+    role = getattr(load_settings(), "role", "ground")
+    return str(role).lower().startswith("module")
 
 
 def main() -> None:  # noqa: D401

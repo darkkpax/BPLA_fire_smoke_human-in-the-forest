@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TelemetryV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "uav_id",
+    "timestamp",
+    "lat",
+    "lon",
+    "alt"
+  ],
+  "properties": {
+    "protocol_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "uav_id": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "lat": {
+      "type": "number",
+      "minimum": -90,
+      "maximum": 90
+    },
+    "lon": {
+      "type": "number",
+      "minimum": -180,
+      "maximum": 180
+    },
+    "alt": {
+      "type": "number"
+    },
+    "yaw": {
+      "type": ["number", "null"]
+    },
+    "pitch": {
+      "type": ["number", "null"]
+    },
+    "roll": {
+      "type": ["number", "null"]
+    },
+    "ground_speed_mps": {
+      "type": ["number", "null"]
+    },
+    "vertical_speed_mps": {
+      "type": ["number", "null"]
+    },
+    "battery_percent": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 100
+    },
+    "gps_fix": {
+      "type": ["integer", "null"]
+    },
+    "satellites": {
+      "type": ["integer", "null"]
+    }
+  }
+}

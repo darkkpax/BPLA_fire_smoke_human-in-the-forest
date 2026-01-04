@@ -23,40 +23,50 @@ class CustomSdkUavAdapter(IUavAdapter):
         """
         self.client_config = client_config
         self.log = logger or logging.getLogger(self.__class__.__name__)
+        self._telemetry_callback: IUavTelemetryConsumer | None = None
         self._running = False
+        self._last_route: Route | None = None
 
     async def start(self, telemetry_callback: IUavTelemetryConsumer) -> None:
         """
-        TODO:
-        - Connect to the client's system.
-        - Subscribe to its telemetry feed.
-        - Translate client's telemetry into TelemetrySample objects.
+        Start the adapter and register the telemetry consumer.
+
+        This adapter does not spawn its own loops; telemetry is injected from the
+        outside (e.g., via integration_service) and forwarded to the callback.
         """
+        self._telemetry_callback = telemetry_callback
         self._running = True
-        self.log.info("Custom SDK adapter stub started (config keys=%s)", list(self.client_config))
+        self.log.info("Custom SDK adapter started (config keys=%s)", list(self.client_config))
 
     async def stop(self) -> None:
-        """TODO: Cleanly disconnect from client's software."""
+        """Mark the adapter as stopped."""
         if not self._running:
             return
         self._running = False
-        self.log.info("Custom SDK adapter stub stopped")
+        self.log.info("Custom SDK adapter stopped")
 
     async def push_route(self, route: Route) -> None:
         """
-        TODO:
-        - Convert Route into whatever mission representation the client's system expects.
-        - Send it through the client's API.
+        Store the latest route; in the future this can be propagated to a client SDK.
         """
-        self.log.debug("push_route called (waypoints=%d)", len(route.waypoints))
+        self._last_route = route
+        self.log.debug("Route received (waypoints=%d)", len(route.waypoints))
 
     async def send_simple_command(self, command: str, payload: dict | None = None) -> None:
         """
-        TODO:
-        - Map generic commands to client's command API.
+        Log a received command; downstream mapping can be added later.
         """
-        self.log.debug("send_simple_command called: %s payload=%s", command, payload)
+        self.log.info("CustomSdkUavAdapter command: %s payload=%s", command, payload)
+
+    @property
+    def telemetry_callback(self) -> IUavTelemetryConsumer | None:
+        """Expose the registered telemetry callback for external injection paths."""
+        return self._telemetry_callback
+
+    @property
+    def last_route(self) -> Route | None:
+        """Return the last route pushed into the adapter."""
+        return self._last_route
 
 
 __all__ = ["CustomSdkUavAdapter"]
-

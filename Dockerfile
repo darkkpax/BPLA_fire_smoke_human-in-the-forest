@@ -1,4 +1,5 @@
-FROM python:3.11-slim AS base
+ARG BASE_IMAGE=python:3.11-slim
+FROM ${BASE_IMAGE} AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -18,8 +19,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt .
 
+ARG INSTALL_TORCH=1
+
 RUN python -m pip install --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
+ && if [ "${INSTALL_TORCH}" = "0" ]; then \
+      python - <<'PY' \
+from pathlib import Path
+src = Path("requirements.txt").read_text().splitlines()
+dst = [line for line in src if not line.startswith(("torch==", "torchvision=="))]
+Path("/tmp/requirements.notorch.txt").write_text("\n".join(dst) + "\n")
+PY
+      && pip install --no-cache-dir -r /tmp/requirements.notorch.txt; \
+    else \
+      pip install --no-cache-dir -r requirements.txt; \
+    fi
 
 COPY . .
 
