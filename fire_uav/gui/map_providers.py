@@ -488,11 +488,17 @@ class OpenLayersMapProvider:
         css_url, js_url = self._asset_urls()
         telemetry = getattr(deps, "latest_telemetry", None)
         drone_pos = None
+        heading = None
         if telemetry is not None and hasattr(telemetry, "lat") and hasattr(telemetry, "lon"):
             try:
                 drone_pos = (float(telemetry.lat), float(telemetry.lon))
             except Exception:
                 drone_pos = None
+            if drone_pos is not None and hasattr(telemetry, "yaw"):
+                try:
+                    heading = float(telemetry.yaw)
+                except Exception:
+                    heading = None
         if drone_pos is None:
             drone_pos = interpolate_path_point(path, getattr(deps, "debug_flight_progress", 0.0))
 
@@ -1094,14 +1100,14 @@ class OpenLayersMapProvider:
     addOverlayLine(data.path_done, 'pathDone');
     addOverlayLine(data.path_remaining, 'pathRemaining');
     addOverlayLine(data.debug_orbit, 'orbit');
-    if (data.drone && data.drone.length >= 2) {
-      setUavPose({
+    if (data.drone && data.drone.length >= 2) {{
+      setUavPose({{
         id: data.uav_id || 'uav',
         lat: data.drone[1],
         lon: data.drone[0],
         heading: data.heading
-      }, false);
-    }
+      }}, false);
+    }}
 
     (data.objects || []).forEach(obj => {{
       addOverlayPoint([obj.lon, obj.lat], 'object', {{
