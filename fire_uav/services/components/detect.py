@@ -37,15 +37,24 @@ class DetectThread(ManagedComponent):
         super().__init__(name="DetectThread")
         self._in_q = in_q
         self._out_q = out_q
-        self._engine = DetectionEngine(
-            wanted_classes=settings.yolo_classes,
-            conf_threshold=settings.yolo_conf,
-            iou_threshold=settings.yolo_iou,
-        )
+        self._engine = None
+        self._disabled_reason: str | None = None
+        try:
+            self._engine = DetectionEngine(
+                wanted_classes=settings.yolo_classes,
+                conf_threshold=settings.yolo_conf,
+                iou_threshold=settings.yolo_iou,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._disabled_reason = str(exc)
         self._stat_ts = time.perf_counter()
         self._last_frame_ts = time.perf_counter()
 
     def loop(self) -> None:
+        if self._engine is None:
+            reason = self._disabled_reason or "unknown error"
+            LOG.warning("Detection disabled: %s", reason)
+            return
         LOG.info("Detector thread started")
         while self.state is State.RUNNING:
             try:

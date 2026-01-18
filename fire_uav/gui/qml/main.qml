@@ -5,6 +5,7 @@ import QtQuick.Layouts 1.15
 import QtQuick.Dialogs
 import QtWebEngine 1.10
 import Qt5Compat.GraphicalEffects
+import QtQuick.Shapes 1.15
 
 ApplicationWindow {
     id: root
@@ -30,6 +31,9 @@ ApplicationWindow {
     property bool isPostflight: missionState === "POSTFLIGHT"
     property bool planConfirmed: hasApp ? app.planConfirmed : false
     property bool bridgeModeEnabled: hasApp ? app.bridgeModeEnabled : false
+    property bool homePickModeActive: hasApp ? app.homePickModeEnabled : false
+    property bool manualTargetModeActive: hasApp ? app.objectSpawnModeEnabled : false
+    property bool mapNeedsRefresh: hasApp ? app.mapRefreshNeeded : false
     property bool toastVisible: false
     property string toastTitle: "Notification"
     property string toastMessage: ""
@@ -46,11 +50,7 @@ ApplicationWindow {
 
     function requestConfirmPlan() {
         if (!hasApp) return;
-        if (bridgeModeEnabled) {
-            confirmPlanDialog.open();
-        } else {
-            app.confirmPlan();
-        }
+        app.confirmPlan();
     }
 
     function requestOrbit() {
@@ -74,10 +74,6 @@ ApplicationWindow {
             } else {
                 runMapTool("stopDraw");
             }
-        }
-        function onMapUavPoseUpdated(uavId, lat, lon, heading) {
-            if (!hasApp) return;
-            runMapTool("setUavPose", { id: uavId, lat: lat, lon: lon, heading: heading });
         }
     }
     Item {
@@ -366,6 +362,54 @@ ApplicationWindow {
                         }
 
                         Item {
+                            id: mapClickOverlay
+                            anchors.fill: parent
+                            z: 4
+                            property bool overlayActive: root.hasApp && (root.homePickModeActive || root.manualTargetModeActive)
+                            visible: overlayActive
+                            MouseArea {
+                                anchors.fill: parent
+                                enabled: overlayActive
+                                hoverEnabled: true
+                                acceptedButtons: Qt.LeftButton
+                                onClicked: {
+                                    if (!root.hasApp) return;
+                                    var script = "window.__mapTools && window.__mapTools.screenToGeo(" + mouse.x + "," + mouse.y + ")";
+                                    mapView.runJavaScript(script, function(result) {
+                                        if (!result || typeof result.lat !== "number" || typeof result.lon !== "number") return;
+                                        if (root.homePickModeActive) {
+                                            app.setHomeFromMap(result.lat, result.lon);
+                                        } else if (root.manualTargetModeActive) {
+                                            app.spawnManualTargetAt(result.lat, result.lon);
+                                        }
+                                    });
+                                }
+                            }
+
+                            Rectangle {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                anchors.bottom: parent.bottom
+                                anchors.bottomMargin: 20
+                                radius: 12
+                                color: Qt.rgba(0, 0, 0, 0.65)
+                                visible: overlayActive
+                                implicitWidth: hintText.implicitWidth + 24
+                                implicitHeight: hintText.implicitHeight + 14
+
+                                Text {
+                                    id: hintText
+                                    anchors.centerIn: parent
+                                    text: root.homePickModeActive
+                                          ? "Click map to set home"
+                                          : root.manualTargetModeActive ? "Click map to spawn a manual target" : ""
+                                    color: "#f8fafc"
+                                    font.pixelSize: 13
+                                    font.family: "Inter"
+                                }
+                            }
+                        }
+
+                        Item {
                             id: mapControls
                             anchors.horizontalCenter: parent.horizontalCenter
                             anchors.top: parent.top
@@ -388,6 +432,9 @@ ApplicationWindow {
                             property bool routeMenuHover: false
                             property bool routeMenuOpen: false
                             property bool routeBridgeHover: false
+                            property bool orbitButtonHover: false
+                            property bool orbitFlyoutHover: false
+                            property bool orbitFlyoutOpen: false
 
                             function updateRouteMenu() {
                                 if (routeButtonHover || routeMenuHover || routeBridgeHover) {
@@ -400,11 +447,29 @@ ApplicationWindow {
                                 }
                             }
 
+                            function updateOrbitFlyout() {
+                                if (orbitButtonHover || orbitFlyoutHover) {
+                                    orbitFlyoutOpen = true;
+                                    orbitFlyoutCloseTimer.stop();
+                                } else {
+                                    if (orbitFlyoutOpen && !orbitFlyoutCloseTimer.running) {
+                                        orbitFlyoutCloseTimer.start();
+                                    }
+                                }
+                            }
+
                             Timer {
                                 id: routeMenuCloseTimer
                                 interval: 500
                                 repeat: false
                                 onTriggered: mapControls.routeMenuOpen = false
+                            }
+
+                            Timer {
+                                id: orbitFlyoutCloseTimer
+                                interval: 220
+                                repeat: false
+                                onTriggered: mapControls.orbitFlyoutOpen = false
                             }
 
                             ShaderEffectSource {
@@ -582,23 +647,13 @@ ApplicationWindow {
                                     }
                                 }
                                 Loader {
-                                    active: isPreflight && !planConfirmed
+                                    active: isPreflight || isReady
                                     sourceComponent: glassButton
                                     onLoaded: {
                                         item.label = "Confirm plan"
                                         item.minWidth = 122
                                         item.enabled = Qt.binding(function() { return hasApp ? app.canConfirmPlan : false; })
                                         item.action = function() { requestConfirmPlan(); }
-                                    }
-                                }
-                                Loader {
-                                    active: (isReady || (isPreflight && planConfirmed))
-                                    sourceComponent: glassButton
-                                    onLoaded: {
-                                        item.label = "Start flight"
-                                        item.minWidth = 120
-                                        item.enabled = Qt.binding(function() { return hasApp ? app.canStartFlight : false; })
-                                        item.action = function() { if (hasApp) app.startFlight(); }
                                     }
                                 }
                                 Loader {
@@ -767,14 +822,72 @@ ApplicationWindow {
                                         item.action = function() { if (hasApp) app.applyRouteEdits(); }
                                     }
                                 }
-                                Loader {
-                                    active: isInFlight
-                                    sourceComponent: glassButton
-                                    onLoaded: {
-                                        item.label = "Orbit object"
-                                        item.minWidth = 116
-                                        item.enabled = Qt.binding(function() { return hasApp ? app.canOrbit : false; })
-                                        item.action = function() { requestOrbit(); }
+                                Item {
+                                    id: orbitButtonGroup
+                                    height: mapControls.buttonHeight
+                                    implicitWidth: orbitPrimary.implicitWidth + orbitFlyoutWrap.width + (orbitFlyoutWrap.width > 0 ? 6 : 0)
+
+                                    Row {
+                                        anchors.fill: parent
+                                        spacing: 6
+
+                                        Loader {
+                                            id: orbitPrimary
+                                            active: isInFlight
+                                            sourceComponent: glassButton
+                                            onLoaded: {
+                                                item.label = "Orbit target"
+                                                item.minWidth = 120
+                                                item.enabled = Qt.binding(function() { return hasApp ? app.canOrbit : false; })
+                                                item.openOnHover = true
+                                                item.hoverAction = function(isHover) {
+                                                    mapControls.orbitButtonHover = isHover;
+                                                    mapControls.updateOrbitFlyout();
+                                                }
+                                                item.action = function() { requestOrbit(); }
+                                            }
+                                        }
+
+                                        Item {
+                                            id: orbitFlyoutWrap
+                                            height: mapControls.buttonHeight
+                                            width: mapControls.orbitFlyoutOpen ? orbitAllTargets.implicitWidth : 0
+                                            visible: width > 0
+                                            opacity: mapControls.orbitFlyoutOpen ? 1.0 : 0.0
+                                            scale: mapControls.orbitFlyoutOpen ? 1.0 : 0.96
+                                            Behavior on width { NumberAnimation { duration: 160; easing.type: Easing.OutQuad } }
+                                            Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
+                                            Behavior on scale { NumberAnimation { duration: 160; easing.type: Easing.OutQuad } }
+
+                                            Loader {
+                                                id: orbitAllTargets
+                                                active: isInFlight
+                                                sourceComponent: glassButton
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                onLoaded: {
+                                                    item.label = "Orbit all targets"
+                                                    item.minWidth = 150
+                                                    item.enabled = Qt.binding(function() {
+                                                        return hasApp ? (app.canOrbit && app.confirmedObjectCount > 0) : false;
+                                                    })
+                                                    item.openOnHover = true
+                                                    item.hoverAction = function(isHover) {
+                                                        mapControls.orbitFlyoutHover = isHover;
+                                                        mapControls.updateOrbitFlyout();
+                                                    }
+                                                    item.action = function() {
+                                                        if (!hasApp) return;
+                                                        var ids = [];
+                                                        var objects = app.confirmedObjects;
+                                                        for (var i = 0; i < objects.length; i++) {
+                                                            ids.push(objects[i].object_id);
+                                                        }
+                                                        app.orbitSelectedObjects(ids);
+                                                    }
+                                                }
+
+                                            }
+                                        }
                                     }
                                 }
                                 Loader {
@@ -785,16 +898,6 @@ ApplicationWindow {
                                         item.minWidth = 116
                                         item.enabled = Qt.binding(function() { return hasApp ? app.canRtl : false; })
                                         item.action = function() { if (hasApp) app.returnToHome(); }
-                                    }
-                                }
-                                Loader {
-                                    active: isInFlight
-                                    sourceComponent: glassButton
-                                    onLoaded: {
-                                        item.label = "Update map"
-                                        item.minWidth = 108
-                                        item.enabled = true
-                                        item.action = function() { if (hasApp) app.refreshMapView(); }
                                     }
                                 }
                                 Loader {
@@ -1340,6 +1443,27 @@ ApplicationWindow {
                                             item.action = function() { mapHud.runTool("resetView"); }
                                         }
                                     }
+                                    Loader {
+                                        sourceComponent: toolsMenuItem
+                                        onLoaded: {
+                                            item.label = "Set home"
+                                            item.action = function() { if (hasApp) app.startHomePickMode(); }
+                                        }
+                                    }
+                                    Loader {
+                                        sourceComponent: toolsMenuItem
+                                        onLoaded: {
+                                            item.label = "Clear home"
+                                            item.action = function() { if (hasApp) app.clearHomeLocation(); }
+                                        }
+                                    }
+                                    Loader {
+                                        sourceComponent: toolsMenuItem
+                                        onLoaded: {
+                                            item.label = "Manual target"
+                                            item.action = function() { if (hasApp) app.startManualTargetMode(); }
+                                        }
+                                    }
                                 }
                             }
 
@@ -1562,7 +1686,6 @@ ApplicationWindow {
         onAccepted: {
             if (!hasApp) return;
             app.confirmPlan();
-            if (bridgeModeEnabled) app.startFlight();
         }
     }
 
@@ -1758,9 +1881,106 @@ ApplicationWindow {
             }
 
             Loader { sourceComponent: navSegment; onLoaded: { item.label = "Detector"; item.index = 0 } }
-            Loader { sourceComponent: navSegment; onLoaded: { item.label = "Planner";  item.index = 1 } }
+            Loader { id: plannerTabLoader; sourceComponent: navSegment; onLoaded: { item.label = "Planner";  item.index = 1 } }
             Loader { sourceComponent: navSegment; onLoaded: { item.label = "Logs";     item.index = 2 } }
         }
+    }
+
+    Item {
+        id: updateMapFloating
+        property bool plannerActive: currentTab === 1
+        property real lift: 0
+        width: Math.max(160, (plannerTabLoader.item ? plannerTabLoader.item.width + 72 : 180))
+        height: 34
+        anchors.horizontalCenter: plannerTabLoader.item ? plannerTabLoader.item.horizontalCenter : navFloating.horizontalCenter
+        anchors.bottom: navFloating.top
+        anchors.bottomMargin: 0
+        visible: plannerActive || opacity > 0.02
+        opacity: 0
+        scale: 0.98
+        z: 60
+        enabled: plannerActive
+        transformOrigin: Item.Bottom
+
+        transform: Translate { y: 8 - (8 * updateMapFloating.lift) }
+
+        Shape {
+            id: updateMapShape
+            anchors.fill: parent
+            antialiasing: true
+
+            ShapePath {
+                strokeWidth: 0
+                strokeColor: "transparent"
+                fillColor: Qt.rgba(0.08, 0.08, 0.08, 0.35)
+                startX: 18
+                startY: updateMapShape.height
+                PathLine { x: updateMapShape.width - 18; y: updateMapShape.height }
+                PathCubic {
+                    x: updateMapShape.width - 44
+                    y: 5
+                    control1X: updateMapShape.width - 10
+                    control1Y: updateMapShape.height
+                    control2X: updateMapShape.width - 10
+                    control2Y: 18
+                }
+                PathLine { x: 44; y: 5 }
+                PathCubic {
+                    x: 18
+                    y: updateMapShape.height
+                    control1X: 10
+                    control1Y: 18
+                    control2X: 10
+                    control2Y: updateMapShape.height
+                }
+            }
+        }
+
+        Text {
+            id: updateMapLabel
+            anchors.centerIn: parent
+            text: "Update map"
+            color: updateMapFloating.enabled ? textPrimary : textMuted
+            font.pixelSize: 13
+            font.family: "Inter"
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            enabled: updateMapFloating.enabled
+            hoverEnabled: updateMapFloating.enabled
+            onEntered: updateMapLabel.color = "#7bc6ff"
+            onExited: updateMapLabel.color = updateMapFloating.enabled ? textPrimary : textMuted
+            onPressed: updateMapFloating.scale = 0.97
+            onReleased: updateMapFloating.scale = 1.0
+            onClicked: { if (hasApp) app.refreshMapView(); }
+        }
+
+        states: [
+            State {
+                name: "shown"
+                when: updateMapFloating.plannerActive
+                PropertyChanges { target: updateMapFloating; opacity: 1; scale: 1.0; lift: 1 }
+            },
+            State {
+                name: "hidden"
+                when: !updateMapFloating.plannerActive
+                PropertyChanges { target: updateMapFloating; opacity: 0; scale: 0.98; lift: 0 }
+            }
+        ]
+
+        transitions: [
+            Transition {
+                from: "hidden"
+                to: "shown"
+                NumberAnimation { properties: "opacity,scale,lift"; duration: 240; easing.type: Easing.OutCubic }
+            },
+            Transition {
+                from: "shown"
+                to: "hidden"
+                NumberAnimation { properties: "opacity,scale,lift"; duration: 220; easing.type: Easing.OutCubic }
+            }
+        ]
     }
 
     Component.onCompleted: {

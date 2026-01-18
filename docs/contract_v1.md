@@ -1,36 +1,36 @@
-# Skysight UAV Contract v1
+# Контракт Skysight UAV v1
 
-This contract defines the canonical control-plane and telemetry schema used inside Skysight. It lets any drone or simulator map their native protocol to a stable, versioned contract and keeps the rest of the system drone-agnostic.
+Этот контракт определяет каноническую схему плоскости управления и телеметрии, используемую внутри Skysight. Он позволяет любому дрону или симулятору сопоставить свой нативный протокол со стабильным, версионируемым контрактом и делает остальную систему независимой от конкретного дрона.
 
-## Versioning rules
-- `protocol_version` is pinned to `1` for all v1 payloads.
-- Additive fields are allowed in a minor update, but existing fields must not change meaning.
-- Breaking changes require a new contract version (v2) and a new endpoint namespace.
+## Правила версионирования
+- `protocol_version` фиксируется на `1` для всех payload v1.
+- Добавочные поля допускаются в минорном обновлении, но существующие поля не должны менять смысл.
+- Ломающие изменения требуют новой версии контракта (v2) и нового пространства имен эндпоинтов.
 
-## Minimal telemetry requirements
-Telemetry is accepted when these fields are present:
+## Минимальные требования к телеметрии
+Телеметрия принимается при наличии полей:
 - `uav_id`
 - `timestamp` (UTC, ISO 8601)
 - `lat`, `lon`, `alt`
 
-Optional fields include:
+Необязательные поля:
 - `battery_percent`
 - `yaw`, `pitch`, `roll`
 - `ground_speed_mps`, `vertical_speed_mps`
 - `gps_fix`, `satellites`
 
-## Capabilities handshake
-Use the handshake to advertise what the UAV can do. The UI and control logic use these flags to enable or disable actions without changing the GUI layout.
+## Handshake возможностей
+Используйте handshake, чтобы объявить, что умеет БПЛА. UI и логика управления используют эти флаги, чтобы включать или отключать действия без изменения компоновки GUI.
 
-Example capabilities flags:
-- `supports_waypoints` (mission/route upload)
-- `supports_rtl` (return-to-launch command)
-- `supports_orbit` (orbit maneuver)
-- `supports_camera` (camera readiness)
+Примеры флагов возможностей:
+- `supports_waypoints` (загрузка миссии/маршрута)
+- `supports_rtl` (команда возврата домой)
+- `supports_orbit` (маневр орбиты)
+- `supports_camera` (готовность камеры)
 
-## Examples
+## Примеры
 
-### Telemetry
+### Телеметрия
 ```json
 {
   "protocol_version": 1,
@@ -44,7 +44,7 @@ Example capabilities flags:
 }
 ```
 
-### Route
+### Маршрут
 ```json
 {
   "protocol_version": 1,
@@ -59,7 +59,7 @@ Example capabilities flags:
 }
 ```
 
-### Command
+### Команда
 ```json
 {
   "protocol_version": 1,
@@ -71,7 +71,7 @@ Example capabilities flags:
 }
 ```
 
-### Handshake request
+### Запрос handshake
 ```json
 {
   "uav_id": "uav-1",
@@ -89,7 +89,7 @@ Example capabilities flags:
 }
 ```
 
-### Handshake response
+### Ответ handshake
 ```json
 {
   "ok": true,

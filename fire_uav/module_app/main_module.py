@@ -9,7 +9,7 @@ from datetime import datetime
 
 import uvicorn
 
-from fire_uav.bootstrap import init_core
+from fire_uav.bootstrap import init_module_core
 from fire_uav.config.logging_config import setup_logging
 from fire_uav.module_app.config import load_module_settings
 from fire_uav.module_app.health_api import app as health_app, configure_health, health_state
@@ -192,7 +192,7 @@ async def _run() -> None:
     health_server: asyncio.Task | None = None
     watchdog: asyncio.Task | None = None
 
-    init_core()  # queues + lifecycle; camera/detector threads if camera present
+    init_module_core()  # queues + lifecycle; camera/detector threads if camera present
 
     energy_model = get_energy_model(cfg)
     planner = PythonRoutePlanner(energy_model=energy_model, settings=cfg)

@@ -1,116 +1,116 @@
-# AGENTS.md
+﻿# AGENTS.md
 
-## Purpose
+## Назначение
 
-This repository contains the Skysight / fire_uav system: onboard CV module + ground application + API/visualizer + optional Unreal integration.  
-This file defines practical rules for assistants (and contributors) so changes stay consistent, safe, and easy to review.
+Этот репозиторий содержит систему Skysight / fire_uav: бортовой CV-модуль + наземное приложение + API/визуализатор + опциональная интеграция с Unreal.  
+Этот файл определяет практические правила для ассистентов (и участников), чтобы изменения оставались последовательными, безопасными и удобными для ревью.
 
-## Repo orientation
+## Ориентация в репозитории
 
-Typical structure (may vary slightly, follow the actual tree):
+Типичная структура (может немного отличаться, ориентируйтесь на фактическое дерево):
 
 - `module_app/`  
-  Runtime app that connects to a UAV adapter, processes telemetry/video/detections, pushes results to `visualizer_api`, emits events to the GUI.
+  Рантайм-приложение, которое подключается к адаптеру БПЛА, обрабатывает телеметрию/видео/детекции, отправляет результаты в `visualizer_api`, отправляет события в GUI.
 - `module_core/`  
-  Core domain logic: schema, detection pipeline, aggregation, geo binding, energy model, route planner, maneuvers, adapters interfaces.
+  Основная доменная логика: схемы, пайплайн детекций, агрегация, геопривязка, модель энергии, планировщик маршрутов, маневры, интерфейсы адаптеров.
 - `ground_app/`  
-  Ground station entrypoint / app wiring (often starts GUI + services).
+  Точка входа наземной станции / связка приложения (часто запускает GUI + сервисы).
 - `gui/`  
-  GUI layer (PySide/PyQt + QML). Do not redesign visuals.
+  Слой GUI (PySide/PyQt + QML). Не перерабатывать визуальную часть.
 - `api/`  
-  `visualizer_api` FastAPI server and WS stream.
+  `visualizer_api` FastAPI сервер и WS-поток.
 - `config/`  
-  Settings model + defaults.
+  Модель настроек + дефолты.
 - `services/`  
-  Event bus and cross-cutting services (notifications, recorder, monitors).
+  Шина событий и сквозные сервисы (уведомления, запись, мониторы).
 
-If something is not found at these paths, search by class/function names and follow existing conventions.
+Если что-то не находится по этим путям, ищите по именам классов/функций и следуйте существующим соглашениям.
 
-## Working rules
+## Рабочие правила
 
-### 1) Do not redesign the GUI
-- Preserve the current UI style: layout, spacing, typography, colors, control sizes.
-- Reuse existing components (toasts, panels, toolbars, button styles).
-- Add new controls only when necessary, and place them in existing areas (toolbar/menu/debug section).
+### 1) Не перерабатывайте GUI
+- Сохраняйте текущий стиль UI: раскладку, отступы, типографику, цвета, размеры элементов управления.
+- Переиспользуйте существующие компоненты (toast-уведомления, панели, тулбары, стили кнопок).
+- Добавляйте новые элементы управления только при необходимости и размещайте их в существующих областях (toolbar/menu/debug секция).
 
-### 2) Prefer additive, minimal diffs
-- Avoid large refactors unless explicitly requested.
-- Do not rename public endpoints, events, or shared models unless strictly necessary.
-- Keep backward compatibility for external interfaces (API, JSON payloads, config keys) whenever possible.
+### 2) Предпочитайте добавочные, минимальные изменения
+- Избегайте крупных рефакторингов, если они явно не запрошены.
+- Не переименовывайте публичные эндпоинты, события или общие модели без строгой необходимости.
+- По возможности сохраняйте обратную совместимость внешних интерфейсов (API, JSON payload, ключи конфигурации).
 
-### 3) Single source of truth
-- Mission state should come from one state machine (not scattered booleans).
-- Link and camera readiness should be derived from monitors (not random UI heuristics).
-- Battery handling should be unified (real telemetry if available; virtual/sim only when missing).
+### 3) Единый источник истины
+- Состояние миссии должно приходить из одной машины состояний (а не из набора разрозненных булевых флагов).
+- Готовность линка и камеры должна вычисляться из мониторов (а не из случайных UI-эвристик).
+- Логику батареи нужно унифицировать (реальная телеметрия при наличии; виртуальная/сим при отсутствии).
 
-### 4) Avoid spam and duplication
-- Notifications must be deduplicated/rate-limited by key and cooldown.
-- Confirmed objects should be emitted/saved once per object id (no “new object every second” flood).
+### 4) Избегайте спама и дублей
+- Уведомления должны дедуплицироваться/ограничиваться по частоте по ключу и таймауту.
+- Подтвержденные объекты должны отправляться/сохраняться один раз на `object_id` (никакого потока "новый объект каждую секунду").
 
-## Code style expectations
+## Ожидания по стилю кода
 
-- Python: follow existing style in repo (type hints, logging, small modules).
-- Avoid heavy new dependencies unless necessary; prefer standard library + already-used libraries.
-- Use `logging.getLogger(__name__)` and keep logs actionable.
-- Keep JSON payloads stable and versionable.
+- Python: следуйте стилю, который уже принят в репозитории (type hints, логирование, небольшие модули).
+- Избегайте тяжелых новых зависимостей без необходимости; предпочитайте стандартную библиотеку и уже используемые библиотеки.
+- Используйте `logging.getLogger(__name__)` и держите логи полезными.
+- Держите JSON payloads стабильными и версионируемыми.
 
-## Event bus conventions
+## Соглашения по шине событий
 
-- Use `services.bus` as the central messaging layer between core/app and GUI.
-- Prefer events with structured payloads (dicts with clear keys).
-- For operator-facing warnings, use one generic toast event (or the existing pattern) and dedupe it.
+- Используйте `services.bus` как центральный слой обмена между core/app и GUI.
+- Предпочитайте события со структурированными payload (dict с понятными ключами).
+- Для предупреждений оператора используйте одно универсальное toast-событие (или существующий паттерн) и дедуплицируйте его.
 
-## Data and persistence
+## Данные и хранение
 
-When implementing storage:
-- Put runtime artifacts under `data/` (or the repo’s existing storage dir).
-- For flights, prefer a session directory per run:
+При реализации хранения:
+- Размещайте артефакты рантайма в `data/` (или в существующем каталоге хранения репозитория).
+- Для полетов предпочтительно создавать директорию сессии на каждый запуск:
   - `plan.json`
   - `telemetry.jsonl`
   - `objects.jsonl`
   - `events.jsonl`
   - `summary.json`
 
-Write in append mode, keep it lightweight.
+Пишите в режиме append, держите это легковесным.
 
-## API rules (visualizer_api)
+## Правила API (visualizer_api)
 
-- Do not change existing endpoints or response shapes without strong reason.
-- Additive endpoints are OK (e.g., `map_snapshot`).
-- Validate inputs and return useful HTTP errors (400/404) rather than 500.
+- Не меняйте существующие эндпоинты или формы ответов без веской причины.
+- Дополнительные эндпоинты допустимы (например, `map_snapshot`).
+- Валидируйте входные данные и возвращайте полезные HTTP-ошибки (400/404), а не 500.
 
-## Simulation and debugging
+## Симуляция и отладка
 
-Because development often happens without a drone:
-- Provide a debug simulation mode that can generate:
-  - telemetry (movement along route),
-  - link connect/disconnect,
-  - camera “frames” availability,
-  - confirmed objects spawning.
-- Simulation must feed into the same pipeline as real adapters so behavior matches production.
+Так как разработка часто идет без дрона:
+- Предусмотрите режим отладочной симуляции, который умеет генерировать:
+  - телеметрию (движение по маршруту),
+  - подключение/отключение линка,
+  - доступность кадров камеры,
+  - появление подтвержденных объектов.
+- Симуляция должна проходить через тот же пайплайн, что и реальные адаптеры, чтобы поведение соответствовало продакшену.
 
-## Where to add new features
+## Куда добавлять новые функции
 
-- Mission workflow/state machine: `module_core/mission/` or `services/` (pick one and keep it consistent).
-- Link and camera monitors: `services/` or `module_core/mission/`.
-- Battery unification: `module_core/battery/`.
-- GUI gating and state-driven buttons: `gui/` (controller signals + QML bindings).
-- Recording: `services/flight_recorder.py`.
+- Миссионный workflow/машина состояний: `module_core/mission/` или `services/` (выберите одно и придерживайтесь последовательности).
+- Мониторы линка и камеры: `services/` или `module_core/mission/`.
+- Унификация батареи: `module_core/battery/`.
+- GUI-гейтинг и кнопки, зависящие от состояния: `gui/` (сигналы контроллера + QML биндинги).
+- Запись: `services/flight_recorder.py`.
 
-Prefer a thin GUI layer: GUI should react to events and state, not implement business logic.
+Предпочитайте тонкий слой GUI: GUI должен реагировать на события и состояние, а не реализовывать бизнес-логику.
 
-## How to verify changes
+## Как проверять изменения
 
-Minimum checks after changes:
-- App starts in planning mode without UAV/sim connected.
-- Route can be drawn/imported/exported without a link.
-- Start flight is blocked if link/camera is missing, with a non-spammy toast.
-- Debug sim can enable link + camera + objects and drive the UI states.
-- Confirmed objects are not duplicated in logs/notifications.
-- Flight session recording creates the expected folder and files.
+Минимальные проверки после изменений:
+- Приложение стартует в режиме планирования без подключенного БПЛА/симулятора.
+- Маршрут можно нарисовать/импортировать/экспортировать без линка.
+- Start Flight заблокирован при отсутствии линка/камеры, с не-спамным уведомлением.
+- Debug sim может включить линк + камеру + объекты и управлять состояниями UI.
+- Подтвержденные объекты не дублируются в логах/уведомлениях.
+- Запись сессии полета создает ожидаемую папку и файлы.
 
-## Notes for assistants
+## Примечания для ассистентов
 
-- If uncertain about an interface, search for existing usage patterns and mirror them.
-- Keep changes small and testable.
-- When adding new config keys, update both the settings model and the default JSON.
+- Если не уверены в интерфейсе, ищите существующие паттерны использования и повторяйте их.
+- Держите изменения небольшими и тестируемыми.
+- При добавлении новых ключей конфигурации обновляйте и модель настроек, и дефолтный JSON.

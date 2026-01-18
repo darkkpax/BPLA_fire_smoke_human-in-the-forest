@@ -1,31 +1,31 @@
-# Operator workflow
+# Рабочий процесс оператора
 
-## Mission states
-- PREFLIGHT: plan routes, import/export, confirm plan; link/camera can be offline.
-- READY: plan confirmed and prerequisites satisfied; start flight available.
-- IN_FLIGHT: flight controls active (edit route, orbit object, return home).
-- RTL: return-to-home flow with minimal controls.
-- POSTFLIGHT: summary shown, return to planning.
-  - Use "Land complete" in RTL to finish a flight and generate the summary.
+## Состояния миссии
+- PREFLIGHT: планирование маршрутов, импорт/экспорт, подтверждение плана; линк/камера могут быть офлайн.
+- READY: план подтвержден и требования выполнены; доступен старт полета.
+- IN_FLIGHT: активны полетные управления (редактирование маршрута, орбита вокруг объекта, возврат домой).
+- RTL: процесс возврата домой с минимальным набором управлений.
+- POSTFLIGHT: показана сводка, возврат к планированию.
+  - Используйте "Land complete" в RTL, чтобы завершить полет и сформировать сводку.
 
-## Readiness checks
-- UAV link status is based on telemetry freshness:
-  - CONNECTED: telemetry age <= 2s
-  - DEGRADED: 2s < age <= 5s
-  - DISCONNECTED: > 5s or never seen
-- Camera status is based on frame activity (stale after 2s).
-- Start Flight is blocked unless link is CONNECTED, camera is READY, and a plan is confirmed.
+## Проверки готовности
+- Статус линка БПЛА основан на свежести телеметрии:
+  - CONNECTED: возраст телеметрии <= 2s
+  - DEGRADED: 2s < возраст <= 5s
+  - DISCONNECTED: > 5s или телеметрия еще не приходила
+- Статус камеры основан на активности кадров (устаревает через 2s).
+- Start Flight блокируется, если линк не CONNECTED, камера не READY, и план не подтвержден.
 
-## Debug simulation
-Open the Debug Console from the main UI:
-- Sim telemetry: generates 10Hz telemetry along the confirmed route (or a small circle).
-- Sim camera: generates frames to drive the camera readiness state.
-- Spawn object: injects a confirmed object through the normal notification path.
+## Отладочная симуляция
+Откройте Debug Console из основного интерфейса:
+- Sim telemetry: генерирует телеметрию 10 Гц вдоль подтвержденного маршрута (или малого круга).
+- Sim camera: генерирует кадры, чтобы обновлять состояние готовности камеры.
+- Spawn object: внедряет подтвержденный объект через обычный путь уведомлений.
 
-## Flight logs
-Each flight session is recorded to:
+## Журналы полетов
+Каждая сессия полета записывается в:
 - `data/flights/<YYYY-MM-DD_HH-MM-SS>/`
-  - `plan.json` (confirmed plan)
+  - `plan.json` (подтвержденный план)
   - `telemetry.jsonl`
   - `objects.jsonl`
   - `events.jsonl`

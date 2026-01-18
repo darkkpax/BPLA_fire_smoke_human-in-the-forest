@@ -31,13 +31,16 @@ last_detection: Any | None = None  # последняя пачка детекц�
 debug_target: dict | None = None  # {"lat": float, "lon": float}
 debug_orbit_path: list[tuple[float, float]] | None = None  # [(lat, lon), ...]
 debug_flight_enabled: bool = False  # флаг режима "flight debug" в GUI
-debug_flight_progress: float = 0.0  # положение 0..1 по маршруту для псевдо-полёта
+debug_flight_progress: float = 0.0  # debug progress 0..1
+debug_flight_completed: bool = False  # debug flight reached end of route
 debug_map_manual_refresh: bool = False  # вручную обновляем позицию дрона на карте
 rtl_path: list[tuple[float, float]] | None = None  # RTL path override for map display
 confirmed_objects: list[dict] = []  # cached confirmed objects for map overlays
 selected_object_id: str | None = None  # selected confirmed object for orbit actions
 latest_telemetry: Any | None = None  # last telemetry sample for map/status
 route_stats: dict | None = None  # cached route battery stats for map overlays
+home_location: dict | None = None  # {"lat": float, "lon": float} for RTL/base
+mission_state: str | None = None  # cached mission state for UI/map
 
 
 # ────────── helpers ────────── #

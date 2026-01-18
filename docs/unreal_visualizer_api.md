@@ -1,13 +1,13 @@
-## UAV Visualizer API (for Unreal / tools)
+﻿## API визуализатора БПЛА (для Unreal / инструментов)
 
-The visualizer API exposes lightweight UAV state (telemetry, route, confirmed objects) for external engines such as Unreal. Run it on the ground machine (e.g. `uvicorn fire_uav.api.visualizer_api:app --host 0.0.0.0 --port 8000`).
+API визуализатора отдает легковесное состояние БПЛА (телеметрия, маршрут, подтвержденные объекты) для внешних движков вроде Unreal. Запускайте его на наземной машине (например, `uvicorn fire_uav.api.visualizer_api:app --host 0.0.0.0 --port 8000`).
 
-Base URL: `http://127.0.0.1:8000`
+Базовый URL: `http://127.0.0.1:8000`
 
-### Endpoints
+### Эндпоинты
 
-- `GET /api/v1/telemetry/{uav_id}` – latest telemetry  
-  Example response:
+- `GET /api/v1/telemetry/{uav_id}` - последняя телеметрия
+  Пример ответа:
   ```json
   {
     "type": "telemetry",
@@ -21,7 +21,7 @@ Base URL: `http://127.0.0.1:8000`
   }
   ```
 
-- `GET /api/v1/route/{uav_id}` – current route  
+- `GET /api/v1/route/{uav_id}` - текущий маршрут
   ```json
   {
     "type": "route",
@@ -35,7 +35,7 @@ Base URL: `http://127.0.0.1:8000`
   }
   ```
 
-- `GET /api/v1/objects/{uav_id}` – confirmed objects list  
+- `GET /api/v1/objects/{uav_id}` - список подтвержденных объектов
   ```json
   [
     {
@@ -52,12 +52,12 @@ Base URL: `http://127.0.0.1:8000`
   ]
   ```
 
-### Map Snapshot
+### Снимок карты
 
-Use these endpoints to register a static map image (PNG/JPG) with known geographic bounds.
+Используйте эти эндпоинты, чтобы зарегистрировать статическое изображение карты (PNG/JPG) с известными географическими границами.
 
-- `POST /api/v1/map_snapshot` – register/update map snapshot metadata  
-  Body:
+- `POST /api/v1/map_snapshot` - зарегистрировать/обновить метаданные снимка карты
+  Тело:
   ```json
   {
     "uav_id": "uav_1",
@@ -70,12 +70,12 @@ Use these endpoints to register a static map image (PNG/JPG) with known geograph
     }
   }
   ```
-  Behavior:
-  - Registers or updates the snapshot for the given UAV.
-  - `image_path` must point to a PNG/JPEG file accessible to `visualizer_api`.
+  Поведение:
+  - Регистрирует или обновляет снимок для данного БПЛА.
+  - `image_path` должен указывать на PNG/JPEG файл, доступный для `visualizer_api`.
 
-- `GET /api/v1/map_snapshot/{uav_id}` – fetch current snapshot  
-  Example response:
+- `GET /api/v1/map_snapshot/{uav_id}` - получить текущий снимок
+  Пример ответа:
   ```json
   {
     "uav_id": "uav_1",
@@ -90,38 +90,38 @@ Use these endpoints to register a static map image (PNG/JPG) with known geograph
   }
   ```
 
-Suggested Unreal flow:
-1. Capture a top-down orthographic screenshot and save it to disk.
-2. Call `POST /api/v1/map_snapshot` with the image path and known bounds.
-3. Set `map_provider="static_image"` in the GUI settings to render the snapshot.
+Рекомендуемый сценарий в Unreal:
+1. Сделайте ортографический скриншот сверху и сохраните его на диск.
+2. Вызовите `POST /api/v1/map_snapshot`, передав путь к изображению и известные границы.
+3. Установите `map_provider="static_image"` в настройках GUI, чтобы отрисовать снимок.
 
-### Message fields
+### Поля сообщений
 - **TelemetryMessage:** `type`, `uav_id`, `timestamp`, `lat`, `lon`, `alt`, `yaw`, `battery`.
 - **RouteMessage:** `type`, `uav_id`, `version`, `waypoints[] {lat, lon, alt}`, `active_index`.
 - **ObjectMessage:** `type`, `uav_id`, `object_id`, `class_id`, `confidence`, `lat`, `lon`, `alt`, `status`.
 
-### Using with Unreal Engine Blueprints
-1. Add an HTTP plugin (e.g. VaRest). Poll endpoints every 0.1–0.2 s.
-2. Parse JSON into Blueprint structs (TelemetryMessage, RouteMessage, ObjectMessage).
-3. Move your UAV actor along `route.waypoints`, highlighting `active_index`.
-4. Spawn markers/decals for entries from `/objects/{uav_id}`.
+### Использование с Unreal Engine Blueprints
+1. Добавьте HTTP-плагин (например, VaRest). Опрос эндпоинтов каждые 0.1-0.2 с.
+2. Парсите JSON в структуры Blueprint (TelemetryMessage, RouteMessage, ObjectMessage).
+3. Перемещайте актор БПЛА вдоль `route.waypoints`, подсвечивая `active_index`.
+4. Создавайте маркеры/декали для элементов из `/objects/{uav_id}`.
 
-Flat-earth lat/lon → Unreal mapping (choose reference `lat0`, `lon0` at level load):
+Плоская модель Земли: преобразование lat/lon в Unreal (выберите опорные `lat0`, `lon0` при загрузке уровня):
 - `dLat = lat - lat0`
 - `dLon = lon - lon0`
 - `y_m = dLat * 111000`
 - `x_m = dLon * 111000 * cos(lat0 radians)`
-- Map to Unreal (1 UU = 1 cm): `X = x_m * 100`, `Y = y_m * 100`, `Z = alt * 100`.
+- Перевод в Unreal (1 UU = 1 см): `X = x_m * 100`, `Y = y_m * 100`, `Z = alt * 100`.
 
-The API is read-only for visualization; mission logic stays in Python (module/ground apps).
+Этот API только для визуализации (read-only); логика миссий остается в Python (приложения module/ground).
 
-## Unreal simulation control API
+## API управления симуляцией в Unreal
 
-The UnrealSimUavAdapter (Python) talks to a separate Unreal-side bridge over HTTP to drive a simulated UAV. The bridge can be implemented in Blueprints, C++, or a small Python service.
+UnrealSimUavAdapter (Python) общается с отдельным мостом на стороне Unreal по HTTP, чтобы управлять симулированным БПЛА. Мост можно реализовать на Blueprints, C++ или в виде небольшого Python-сервиса.
 
-Base URL: `http://127.0.0.1:9000` (matches `settings.unreal_base_url`).
+Базовый URL: `http://127.0.0.1:9000` (соответствует `settings.unreal_base_url`).
 
-- `GET /sim/v1/telemetry` – returns a `TelemetryMessage` JSON:
+- `GET /sim/v1/telemetry` - возвращает JSON `TelemetryMessage`:
   ```json
   {
     "type": "telemetry",
@@ -134,25 +134,25 @@ Base URL: `http://127.0.0.1:9000` (matches `settings.unreal_base_url`).
     "battery": 0.82
   }
   ```
-- `POST /sim/v1/route` – accepts a `RouteMessage` JSON with `waypoints[]` and `active_index` to move the simulated UAV along a path.
-- `POST /sim/v1/command` – accepts:
+- `POST /sim/v1/route` - принимает JSON `RouteMessage` с `waypoints[]` и `active_index`, чтобы двигать симулированный БПЛА вдоль маршрута.
+- `POST /sim/v1/command` - принимает:
   ```json
   { "uav_id": "sim", "command": "RESET", "payload": {} }
   ```
 
-This control API is independent from the read-only `visualizer_api`: it drives the simulation (telemetry polling + route/command pushes), while `visualizer_api` stays for visualization of real flights.
+Этот API управления независим от read-only `visualizer_api`: он двигает симуляцию (опрос телеметрии + пуш маршрутов/команд), а `visualizer_api` остается для визуализации реальных полетов.
 
-### Local testing bridge (Python)
+### Локальный тестовый мост (Python)
 
-The repository ships a minimal bridge stub that implements the same `/sim/v1/*` contract and simulates a UAV moving along uploaded waypoints. It is useful when Unreal is not available yet or as a reference for Blueprint/C++ code.
+В репозитории есть минимальный stub-мост, который реализует тот же контракт `/sim/v1/*` и симулирует движение БПЛА по загруженным точкам. Он полезен, когда Unreal еще недоступен, или как референс для Blueprint/C++ кода.
 
 ```bash
 UNREAL_BRIDGE_PORT=9000 python scripts/unreal_bridge_stub.py
 # or: uvicorn scripts.unreal_bridge_stub:app --host 0.0.0.0 --port 9000
 ```
 
-Steps to try end-to-end with the module runtime:
-1. Start the stub (see above).
-2. Set `uav_backend=unreal` and `unreal_base_url=http://127.0.0.1:9000` (in `fire_uav/config/settings_default.json` or via `FIRE_UAV_SETTINGS`) and run the module: `FIRE_UAV_ROLE=module poetry run python -m fire_uav.main`.
-3. POST a `RouteMessage` to the stub (or call `UnrealSimUavAdapter.push_route(...)` from your flow) to make the simulated UAV “fly” and emit telemetry along the path.
-4. Poll telemetry from `visualizer_api` or subscribe to `/ws/v1/stream` to render in Unreal.
+Шаги, чтобы проверить сквозной сценарий с рантаймом модуля:
+1. Запустите stub (см. выше).
+2. Установите `uav_backend=unreal` и `unreal_base_url=http://127.0.0.1:9000` (в `fire_uav/config/settings_default.json` или через `FIRE_UAV_SETTINGS`) и запустите модуль: `FIRE_UAV_ROLE=module poetry run python -m fire_uav.main`.
+3. Отправьте `RouteMessage` в stub через POST (или вызовите `UnrealSimUavAdapter.push_route(...)` из вашего сценария), чтобы симулированный БПЛА полетел и начал отдавать телеметрию по маршруту.
+4. Опросите телеметрию из `visualizer_api` или подпишитесь на `/ws/v1/stream`, чтобы отрисовать в Unreal.

@@ -5,6 +5,7 @@ import json
 import logging
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from datetime import datetime
 from typing import Callable, Final
@@ -545,8 +546,10 @@ class AppController(QObject):
     cameraStatusChanged = Signal()
     flightControlsChanged = Signal()
     flightSummaryChanged = Signal()
-    mapUavPoseUpdated = Signal(str, float, float, float)
     uavStatesChanged = Signal()
+    homePickModeChanged = Signal()
+    objectSpawnModeChanged = Signal()
+    mapRefreshNeededChanged = Signal()
 
     def __init__(
         self,
@@ -590,6 +593,7 @@ class AppController(QObject):
         self._link_status = LinkStatus.DISCONNECTED
         self._camera_status = CameraStatus.NOT_READY
         self._mission_state = self._mission.current_state
+        deps.mission_state = self._mission_state.value
         self._allow_unsafe_start = False
         self._mission.set_allow_unsafe_start(self._allow_unsafe_start)
         self._commands_enabled = True
@@ -605,11 +609,6 @@ class AppController(QObject):
         self._latest_telemetry: TelemetrySample | None = None
         self._uav_states: dict[str, UavState] = {}
         self._telemetry_store = TelemetryStore()
-        self._last_sent_pose: dict[str, tuple[float, float, float]] = {}
-        self._map_update_timer = QTimer(self)
-        self._map_update_timer.setInterval(250)
-        self._map_update_timer.timeout.connect(self._emit_map_updates)
-        self._map_update_timer.start()
         self._active_path = ActivePathController(
             confirmed_path_provider=self.get_confirmed_path,
             draft_path_provider=self._plan_vm.get_path,
@@ -637,6 +636,10 @@ class AppController(QObject):
         self._route_battery_text = "Route: --"
         self._route_battery_remaining_text = "Remaining: --"
         self._route_battery_warning = False
+        self._home_persist_path = Path(__file__).resolve().parents[3] / "data" / "artifacts" / "home.json"
+        self._home_pick_mode = False
+        self._object_spawn_mode = False
+        self._map_refresh_needed = False
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(500)
         self._status_timer.timeout.connect(self._on_status_tick)
@@ -665,6 +668,7 @@ class AppController(QObject):
         bus.subscribe(Event.CAPABILITIES_UPDATED, self._on_capabilities_updated)
         bus.subscribe(Event.WARNING_TOAST, self._on_warning_toast)
         bus.subscribe(Event.FLIGHT_SESSION_ENDED, self._on_flight_session_ended)
+        self._load_persisted_home_location()
         self._update_route_estimate(self._active_path.get_active_path())
         self.map_bridge.render_map()
 
@@ -815,6 +819,18 @@ class AppController(QObject):
     def mapBridgeScript(self) -> str:
         return self.map_bridge.bridgeScript
 
+    @Property(bool, notify=homePickModeChanged)
+    def homePickModeEnabled(self) -> bool:
+        return self._home_pick_mode
+
+    @Property(bool, notify=objectSpawnModeChanged)
+    def objectSpawnModeEnabled(self) -> bool:
+        return self._object_spawn_mode
+
+    @Property(bool, notify=mapRefreshNeededChanged)
+    def mapRefreshNeeded(self) -> bool:
+        return self._map_refresh_needed
+
     @Property(float, notify=statsChanged)
     def fps(self) -> float:
         return self._fps
@@ -920,7 +936,86 @@ class AppController(QObject):
 
     @Slot()
     def refreshMapView(self) -> None:
+        # WebEngine map updates are intentionally manual to avoid severe FPS degradation.
         self.map_bridge.render_map()
+        self._set_map_refresh_needed(False)
+
+    @Slot()
+    def startHomePickMode(self) -> None:
+        if self._home_pick_mode:
+            return
+        self._home_pick_mode = True
+        self.homePickModeChanged.emit()
+        self.toastRequested.emit("Click the map to set home")
+
+    @Slot()
+    def stopHomePickMode(self) -> None:
+        if not self._home_pick_mode:
+            return
+        self._home_pick_mode = False
+        self.homePickModeChanged.emit()
+
+    @Slot(float, float)
+    def setHomeFromMap(self, lat: float, lon: float) -> None:
+        _log.info("HOME_PICK click lat=%.6f lon=%.6f", lat, lon)
+        self._set_home_location(lat, lon)
+        self.stopHomePickMode()
+        self._set_map_refresh_needed(True)
+        self.toastRequested.emit(f"Home set: {lat:.6f}, {lon:.6f} — click Update map")
+
+    @Slot()
+    def clearHomeLocation(self) -> None:
+        self.stopHomePickMode()
+        if getattr(deps, "home_location", None) is None:
+            self.toastRequested.emit("Home location not set")
+            return
+        deps.home_location = None
+        setattr(settings, "home_lat", None)
+        setattr(settings, "home_lon", None)
+        self._clear_persisted_home_location()
+        self._set_map_refresh_needed(True)
+        _log.info("Home location cleared")
+        self.toastRequested.emit("Home cleared — click Update map")
+
+    @Slot()
+    def startManualTargetMode(self) -> None:
+        if self._object_spawn_mode:
+            return
+        self._object_spawn_mode = True
+        self.objectSpawnModeChanged.emit()
+        self.toastRequested.emit("Click the map to spawn a manual target")
+
+    @Slot()
+    def stopManualTargetMode(self) -> None:
+        if not self._object_spawn_mode:
+            return
+        self._object_spawn_mode = False
+        self.objectSpawnModeChanged.emit()
+
+    @Slot(float, float)
+    def spawnManualTargetAt(self, lat: float, lon: float) -> None:
+        try:
+            lat_val = float(lat)
+            lon_val = float(lon)
+        except (TypeError, ValueError):
+            return
+        _log.info("MANUAL_TARGET click lat=%.6f lon=%.6f", lat_val, lon_val)
+        object_id = f"manual-{uuid.uuid4().hex[:8]}"
+        payload = {
+            "object_id": object_id,
+            "class_id": 0,
+            "confidence": 0.0,
+            "lat": lat_val,
+            "lon": lon_val,
+            "track_id": None,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+        bus.emit(Event.OBJECT_CONFIRMED_UI, payload)
+        self._objects_store.set_selected(object_id)
+        deps.selected_object_id = object_id
+        self.stopManualTargetMode()
+        self._set_map_refresh_needed(True)
+        self.toastRequested.emit("Manual target created — click Update map")
 
     @Slot()
     def generatePath(self) -> None:
@@ -948,6 +1043,9 @@ class AppController(QObject):
         if not path:
             self.toastRequested.emit("Draw/generate a route first")
             return
+        if not self._telemetry_available():
+            self.toastRequested.emit("Telemetry unavailable; enable Sim telemetry or connect UAV")
+            return
         if not self._mission.confirm_plan(path):
             self.toastRequested.emit("Route invalid; cannot confirm")
             return
@@ -963,7 +1061,9 @@ class AppController(QObject):
                     severity="warn",
                     cooldown_s=8,
                 )
-        self.toastRequested.emit("Plan confirmed")
+        self.startFlight()
+        if self._mission.current_state != MissionState.IN_FLIGHT:
+            self.toastRequested.emit("Plan confirmed")
 
     @Slot()
     def startFlight(self) -> None:
@@ -1005,6 +1105,7 @@ class AppController(QObject):
             self._active_path.clear_overrides_on_new_flight()
             self.flightControlsChanged.emit()
             self.toastRequested.emit("Flight started")
+            self.refreshMapView()
 
     @Slot()
     def editRoute(self) -> None:
@@ -1125,17 +1226,39 @@ class AppController(QObject):
         self._orbit_targets(targets)
 
     @Slot(bool)
-    def setSimTelemetryEnabled(self, enabled: bool) -> None:
+    def setSimTelemetryEnabled(
+        self,
+        enabled: bool,
+        *,
+        notify_route_missing: bool = True,
+        allow_without_route: bool = False,
+    ) -> bool:
         if self._debug_sim is None:
-            return
-        if enabled and not (self._mission.confirmed_plan or self._plan_vm.get_path()):
-            self.toastRequested.emit("Draw/generate a route first")
-            return
+            return False
+        enabled = bool(enabled)
+        was_enabled = self._debug_sim.telemetry_enabled()
+        if (
+            enabled
+            and not allow_without_route
+            and not (self._mission.confirmed_plan or self._plan_vm.get_path())
+        ):
+            if notify_route_missing:
+                self.toastRequested.emit("Draw/generate a route first")
+            return False
+        if enabled and not was_enabled:
+            self._debug_sim.reset_progress()
+            deps.debug_flight_progress = 0.0
+            if self._latest_telemetry is not None:
+                source = getattr(self._latest_telemetry, "source", None)
+                if source == "debug":
+                    self._latest_telemetry = None
+                    deps.latest_telemetry = None
         self._debug_sim.set_telemetry_enabled(enabled)
         deps.debug_flight_enabled = enabled
         deps.debug_map_manual_refresh = bool(enabled)
         self.debugModeChanged.emit()
         self.statsChanged.emit()
+        return bool(self._debug_sim.telemetry_enabled())
 
     @Slot(bool)
     def setSimCameraEnabled(self, enabled: bool) -> None:
@@ -1149,8 +1272,25 @@ class AppController(QObject):
 
     @Slot(bool)
     def setBridgeModeEnabled(self, enabled: bool) -> None:
-        self._bridge_mode_enabled = bool(enabled)
+        desired = bool(enabled)
+        if self._bridge_mode_enabled == desired:
+            return
+        self._bridge_mode_enabled = desired
         self.bridgeModeChanged.emit()
+        _log.info("BRIDGE_MODE -> %s", "ON" if desired else "OFF")
+
+        if self._debug_sim is not None:
+            self._debug_sim.set_bridge_mode(desired)
+            if desired:
+                self.setSimTelemetryEnabled(
+                    True,
+                    notify_route_missing=False,
+                    allow_without_route=True,
+                )
+                _log.info("SIM_TELEMETRY ON (bridge)")
+                self.setSimCameraEnabled(True)
+                _log.info("SIM_CAMERA ON (bridge)")
+
         self.flightControlsChanged.emit()
         self._update_route_estimate()
 
@@ -1184,6 +1324,14 @@ class AppController(QObject):
 
     @Slot()
     def startFlightDebugMode(self) -> None:
+        if self._debug_sim is not None:
+            self._debug_sim.reset_progress()
+            deps.debug_flight_progress = 0.0
+            if self._latest_telemetry is not None:
+                source = getattr(self._latest_telemetry, "source", None)
+                if source == "debug":
+                    self._latest_telemetry = None
+                    deps.latest_telemetry = None
         self.setSimTelemetryEnabled(True)
         self.toastRequested.emit("Sim telemetry ON")
 
@@ -1353,9 +1501,13 @@ class AppController(QObject):
             new_state = MissionState(str(state_raw))
         except Exception:
             return
-        if new_state == self._mission_state:
+        prev_state = self._mission_state
+        if new_state == prev_state:
             return
         self._mission_state = new_state
+        deps.mission_state = self._mission_state.value
+        if prev_state == MissionState.READY and new_state == MissionState.IN_FLIGHT:
+            _log.info("missionState transition: %s -> %s", prev_state.value, new_state.value)
         if new_state in (MissionState.PREFLIGHT, MissionState.READY):
             self._route_edit_mode = False
             self._staged_plan = None
@@ -1371,9 +1523,6 @@ class AppController(QObject):
                 self.flightSummaryChanged.emit()
         if new_state == MissionState.IN_FLIGHT:
             self._commands_enabled = self._link_monitor.is_link_ok()
-            if self._bridge_mode_enabled and self._debug_sim is not None:
-                if not self._debug_sim.telemetry_enabled():
-                    self.setSimTelemetryEnabled(True)
         if new_state == MissionState.RTL:
             self._commands_enabled = self._link_monitor.is_link_ok()
         if new_state == MissionState.POSTFLIGHT:
@@ -1503,12 +1652,66 @@ class AppController(QObject):
         ]
         self.confirmedObjectsChanged.emit()
         self.flightControlsChanged.emit()
+        _log.info("OBJECT_CONFIRMED_UI store count=%d", self._objects_store.count())
+
+    def _set_map_refresh_needed(self, needed: bool) -> None:
+        flag = bool(needed)
+        if flag == self._map_refresh_needed:
+            return
+        self._map_refresh_needed = flag
+        self.mapRefreshNeededChanged.emit()
+
+    def _set_home_location(self, lat: float, lon: float) -> None:
         try:
-            self.map_bridge.render_map()
-        except Exception:
-            pass
+            lat_val = float(lat)
+            lon_val = float(lon)
+        except (TypeError, ValueError):
+            return
+        deps.home_location = {"lat": lat_val, "lon": lon_val}
+        setattr(settings, "home_lat", lat_val)
+        setattr(settings, "home_lon", lon_val)
+        self._persist_home_location(lat_val, lon_val)
+        _log.info("HOME_PICK stored lat=%.6f lon=%.6f", lat_val, lon_val)
+
+    def _load_persisted_home_location(self) -> None:
+        path = self._home_persist_path
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _log.warning("Failed to read persisted home location")
+            return
+        lat = payload.get("lat")
+        lon = payload.get("lon")
+        try:
+            lat_val = float(lat)
+            lon_val = float(lon)
+        except (TypeError, ValueError):
+            return
+        deps.home_location = {"lat": lat_val, "lon": lon_val}
+        setattr(settings, "home_lat", lat_val)
+        setattr(settings, "home_lon", lon_val)
+        _log.info("HOME_PICK loaded lat=%.6f lon=%.6f", lat_val, lon_val)
+
+    def _persist_home_location(self, lat: float, lon: float) -> None:
+        try:
+            self._home_persist_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"lat": float(lat), "lon": float(lon)}
+            self._home_persist_path.write_text(json.dumps(payload, indent=2))
+        except Exception:  # noqa: BLE001
+            _log.exception("Failed to persist home location")
+
+    def _clear_persisted_home_location(self) -> None:
+        try:
+            if self._home_persist_path.exists():
+                self._home_persist_path.unlink()
+        except Exception:  # noqa: BLE001
+            _log.exception("Failed to delete persisted home location")
 
     def _current_action_policy(self) -> MissionActionPolicy:
+        telemetry_available = self._telemetry_available()
+        at_home = self._is_at_home()
         selected = self._objects_store.selected()
         selected_id = selected.object_id if selected else None
         supports_waypoints = bool(self._capabilities.get("supports_waypoints", True))
@@ -1528,7 +1731,55 @@ class AppController(QObject):
             supports_waypoints=supports_waypoints,
             supports_orbit=supports_orbit,
             supports_rtl=supports_rtl,
+            telemetry_available=telemetry_available,
+            at_home=at_home,
         )
+
+    def _resolve_landing_target(self) -> WorldCoord | None:
+        home = getattr(deps, "home_location", None)
+        if isinstance(home, dict):
+            lat = home.get("lat")
+            lon = home.get("lon")
+            if lat is not None and lon is not None:
+                try:
+                    return WorldCoord(lat=float(lat), lon=float(lon))
+                except (TypeError, ValueError):
+                    return None
+        for lat_key, lon_key in (("home_lat", "home_lon"), ("base_lat", "base_lon")):
+            lat = getattr(settings, lat_key, None)
+            lon = getattr(settings, lon_key, None)
+            if lat is not None and lon is not None:
+                try:
+                    return WorldCoord(lat=float(lat), lon=float(lon))
+                except (TypeError, ValueError):
+                    return None
+        path = self._mission.confirmed_plan or self._plan_vm.get_path()
+        if path:
+            lat, lon = path[0]
+            return WorldCoord(lat=float(lat), lon=float(lon))
+        return None
+
+    def _is_at_home(self) -> bool:
+        if self._latest_telemetry is None:
+            return False
+        target = self._resolve_landing_target()
+        if target is None:
+            return False
+        try:
+            dist = haversine_m(
+                (self._latest_telemetry.lat, self._latest_telemetry.lon),
+                (target.lat, target.lon),
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        return dist <= 30.0
+
+    def _telemetry_available(self) -> bool:
+        if self._link_monitor.is_link_ok():
+            return True
+        if self._debug_sim is not None and self._debug_sim.telemetry_enabled():
+            return True
+        return False
 
     def _emit_warning(self, *, key: str, message: str, severity: str, cooldown_s: float) -> None:
         bus.emit(
@@ -1608,7 +1859,7 @@ class AppController(QObject):
         total_required = required_percent + reserved
         remaining = available - total_required
 
-        if not self._link_monitor.is_link_ok() and not self._bridge_mode_enabled:
+        if not self._link_monitor.is_link_ok():
             self._emit_warning(
                 key="no_uav_stub_battery",
                 message="UAV link missing; using stub battery model",
@@ -1753,36 +2004,6 @@ class AppController(QObject):
         if source:
             return str(source)
         return str(getattr(settings, "uav_id", None) or "uav")
-
-    def _should_emit_uav_pose(
-        self,
-        uav_id: str,
-        lat: float,
-        lon: float,
-        heading: float,
-    ) -> bool:
-        last = self._last_sent_pose.get(uav_id)
-        if last is None:
-            return True
-        last_lat, last_lon, last_heading = last
-        if haversine_m((lat, lon), (last_lat, last_lon)) >= 2.0:
-            return True
-        delta = abs(((heading - last_heading + 180.0) % 360.0) - 180.0)
-        return delta >= 3.0
-
-    def _emit_map_updates(self) -> None:
-        for envelope in self._telemetry_store.items():
-            sample = envelope.sample
-            try:
-                lat = float(sample.lat)
-                lon = float(sample.lon)
-                heading = float(getattr(sample, "yaw", 0.0) or 0.0)
-            except Exception:
-                continue
-            if not self._should_emit_uav_pose(envelope.uav_id, lat, lon, heading):
-                continue
-            self._last_sent_pose[envelope.uav_id] = (lat, lon, heading)
-            self.mapUavPoseUpdated.emit(envelope.uav_id, lat, lon, heading)
 
     def _send_rtl_route(self) -> bool:
         route = self._build_rtl_route()

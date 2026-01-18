@@ -1,68 +1,84 @@
 # mypy: ignore-errors
-"""
-CameraThread с метрикой FPS: каждые 5 с пишет INFO «Camera FPS: xx»,
-и при каждом кадре инкрементирует Prometheus-Gauge.
-"""
+"""Headless camera worker that captures frames and pushes them to a queue."""
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Final
+from typing import Callable, Final
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QThread, Signal
 
 from fire_uav.services.components.base import ManagedComponent, State
 from fire_uav.services.metrics import fps_gauge
 
 LOG: Final = logging.getLogger("camera")
 
+FrameCallback = Callable[[np.ndarray], None]
+ErrorCallback = Callable[[str], None]
 
-class _CameraQtThread(QThread):
-    frame: Signal = Signal(np.ndarray)
-    error: Signal = Signal(str)
 
-    _LOG_EVERY: Final[float] = 5.0  # сек
+class CameraThread(ManagedComponent):
+    """Managed camera capture worker without Qt dependencies."""
 
-    def __init__(self, src: int | str, fps: int, out_q=None) -> None:
-        super().__init__()
-        self._src, self._fps, self._q = src, fps, out_q
+    _LOG_EVERY: Final[float] = 5.0
+
+    def __init__(
+        self,
+        index: int | str = 0,
+        fps: int = 30,
+        out_queue=None,
+        *,
+        on_frame: FrameCallback | None = None,
+        on_error: ErrorCallback | None = None,
+    ) -> None:
+        super().__init__(name="CameraThread")
+        self.index = index
+        self.fps = fps
+        self._q = out_queue
+        self._on_frame = on_frame
+        self._on_error = on_error
         self._sleep = 1 / fps if fps else 0
-        self._running = True
-
-        # статистика локального лога
         self._stat_ts = time.perf_counter()
         self._stat_frames = 0
 
-    def stop(self) -> None:
-        self._running = False
+    def _emit_frame(self, frame: np.ndarray) -> None:
+        if self._on_frame is not None:
+            try:
+                self._on_frame(frame)
+            except Exception:  # noqa: BLE001
+                pass
+        if self._q is not None:
+            try:
+                self._q.put_nowait(frame)
+            except Exception:  # noqa: BLE001
+                pass
 
-    def run(self) -> None:
-        cap = cv2.VideoCapture(self._src)
+    def _emit_error(self, message: str) -> None:
+        if self._on_error is not None:
+            try:
+                self._on_error(message)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            LOG.warning(message)
+
+    def loop(self) -> None:
+        cap = cv2.VideoCapture(self.index)
         if not cap.isOpened():
-            self.error.emit("Camera not opened")
+            self._emit_error("Camera not opened")
             return
 
-        while self._running:
+        while not self._stop_event.is_set():
             ok, frame = cap.read()
             if not ok:
-                self.error.emit("Failed to read frame")
+                self._emit_error("Failed to read frame")
                 break
 
-            # отдадим кадр UI и в очередь
-            self.frame.emit(frame)
-            if self._q is not None:
-                try:
-                    self._q.put_nowait(frame)
-                except Exception:
-                    pass
+            self._emit_frame(frame)
 
-            # ---- Prometheus метрика ----
             fps_gauge.inc()
-
-            # ---- локальная статистика каждые 5 с ----
             self._stat_frames += 1
             now = time.perf_counter()
             if now - self._stat_ts >= self._LOG_EVERY:
@@ -74,26 +90,8 @@ class _CameraQtThread(QThread):
                 time.sleep(self._sleep)
 
         cap.release()
-
-
-class CameraThread(ManagedComponent):
-    """Managed-компонент для интеграции в LifecycleManager."""
-
-    def __init__(self, index: int | str = 0, fps: int = 30, out_queue=None) -> None:
-        super().__init__(name="CameraThread")
-        self.index = index
-        self.fps = fps
-        self._qt = _CameraQtThread(index, fps, out_queue)
-
-        # прокидываем Qt-сигналы наружу
-        self.frame = self._qt.frame
-        self.error = self._qt.error
-
-    def loop(self) -> None:
-        self._qt.start()
-        self._qt.wait()
+        self.state = State.STOPPED
 
     def stop(self) -> None:
-        self._qt.stop()
-        self._qt.wait()
+        super().stop()
         self.state = State.STOPPED

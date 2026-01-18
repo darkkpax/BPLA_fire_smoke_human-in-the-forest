@@ -23,7 +23,7 @@ except ImportError:
         ) from exc
 
 import fire_uav.infrastructure.providers as deps
-from fire_uav.bootstrap import init_core
+from fire_uav.bootstrap import init_ground_core
 from fire_uav.gui.windows.main_window import MainWindow
 from fire_uav.config.logging_config import setup_logging
 from fire_uav.ground_app.config import load_ground_settings
@@ -32,7 +32,7 @@ from fire_uav.ground_app.config import load_ground_settings
 def main() -> None:  # noqa: D401
     cfg = load_ground_settings()
     setup_logging(cfg)
-    init_core()  # создаёт очереди, lifecycle, bus-binding
+    init_ground_core()  # создаёт очереди, lifecycle, bus-binding
 
     QtWebEngine.initialize()
     app = QGuiApplication(sys.argv)

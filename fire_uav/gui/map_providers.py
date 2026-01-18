@@ -45,6 +45,49 @@ class FoliumMapProvider:
 
   function sendPath(gj) { console.log('PY_PATH ' + JSON.stringify(gj)); }
   function sendTarget(gj) { console.log('PY_TARGET ' + JSON.stringify(gj)); }
+  function sendHome(lat, lon) { console.log('PY_HOME ' + JSON.stringify({lat, lon})); }
+  function sendObject(payload) { console.log('PY_OBJECT ' + JSON.stringify(payload)); }
+
+  const homeCoord = window.__homeCoord && typeof window.__homeCoord.lat === 'number'
+      && typeof window.__homeCoord.lon === 'number'
+      ? L.latLng(window.__homeCoord.lat, window.__homeCoord.lon)
+      : null;
+  const homeSnapThresholdM = 100.0;
+
+  let spawnMode = false;
+  let homeMode = false;
+  function setObjectSpawnMode(enabled) { spawnMode = !!enabled; }
+  function setHomeMode(enabled) { homeMode = !!enabled; }
+
+  const screenToGeo = (x, y) => {
+      if (!map || typeof map.containerPointToLatLng !== 'function') return null;
+      const latlng = map.containerPointToLatLng([x, y]);
+      if (!latlng) return null;
+      return { lat: latlng.lat, lon: latlng.lng };
+  };
+
+  const objectLayer = L.layerGroup().addTo(map);
+  function setObjects(objects) {
+      objectLayer.clearLayers();
+      if (!Array.isArray(objects)) return;
+      objects.forEach(obj => {
+          if (!obj) return;
+          const lat = Number(obj.lat);
+          const lon = Number(obj.lon);
+          if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+          const objectId = obj.object_id || '';
+          const isSelected = !!obj.selected;
+          const marker = L.circleMarker([lat, lon], {
+              radius: 6,
+              color: '#000000',
+              fill: true,
+              fillColor: '#ffffff',
+              weight: isSelected ? 3 : 2
+          });
+          marker.on('click', () => sendObject({ object_id: objectId, lat, lon }));
+          marker.addTo(objectLayer);
+      });
+  }
 
   map.on(L.Draw.Event.CREATED, e => {
       if (e.layerType === 'polyline') {
@@ -78,13 +121,100 @@ class FoliumMapProvider:
       }
   });
 
+  map.on('click', e => {
+      if (!e || !e.latlng) return;
+      if (homeMode) {
+          sendHome(e.latlng.lat, e.latlng.lng);
+          homeMode = false;
+          return;
+      }
+      if (!spawnMode) return;
+  });
+
+  let activeDraw = null;
+  map.on(L.Draw.Event.DRAWSTART, e => {
+      if (e.layerType !== 'polyline') return;
+      const toolbar = map._drawControl && map._drawControl._toolbars && map._drawControl._toolbars.draw;
+      if (toolbar && toolbar._modes && toolbar._modes.polyline) {
+          activeDraw = toolbar._modes.polyline.handler;
+      }
+  });
+  map.on(L.Draw.Event.DRAWSTOP, () => { activeDraw = null; });
+  map.on(L.Draw.Event.DRAWVERTEX, () => {
+      if (!activeDraw || !homeCoord) return;
+      const poly = activeDraw._poly;
+      if (!poly || !poly.getLatLngs) return;
+      const latlngs = poly.getLatLngs();
+      if (!latlngs || !latlngs.length) return;
+      const first = latlngs[0];
+      if (!first) return;
+      if (map.distance(first, homeCoord) > homeSnapThresholdM) return;
+      latlngs[0] = homeCoord;
+      poly.setLatLngs(latlngs);
+  });
+
   map.on('tileerror', e => {
       const src = e && e.tile ? e.tile.src : '';
       console.error('Tile load failed' + (src ? (': ' + src) : ''));
   });
 
+  window.__mapTools = window.__mapTools || {};
+  window.__mapTools.screenToGeo = screenToGeo;
+  window.__mapTools.setObjectSpawnMode = setObjectSpawnMode;
+  window.__mapTools.setHomeMode = setHomeMode;
+  window.__mapTools.setObjects = setObjects;
+
   const uavMarkers = new Map();
   const uavAnim = new Map();
+
+  function ensureUavStyle() {
+      if (document.getElementById('uav-style')) return;
+      const style = document.createElement('style');
+      style.id = 'uav-style';
+      style.textContent = `
+        .uav-marker {
+          background: transparent;
+          border: none;
+        }
+        .uav-icon {
+          width: 22px;
+          height: 22px;
+          transform: translateZ(0);
+        }
+        .uav-icon svg {
+          width: 100%;
+          height: 100%;
+          transform-origin: 50% 50%;
+        }
+        .uav-icon .uav-shape {
+          fill: #ffffff;
+          stroke: #000000;
+          stroke-width: 2.5;
+        }
+      `;
+      document.head.appendChild(style);
+  }
+
+  function buildUavIcon() {
+      ensureUavStyle();
+      const svg = '<div class="uav-icon"><svg viewBox="0 0 24 24" aria-hidden="true">' +
+                  '<polygon class="uav-shape" points="12,2 22,22 2,22"></polygon>' +
+                  '</svg></div>';
+      return L.divIcon({
+          className: 'uav-marker',
+          html: svg,
+          iconSize: [22, 22],
+          iconAnchor: [11, 11]
+      });
+  }
+
+  function updateUavRotation(marker, heading) {
+      if (!marker || !marker._icon) return;
+      const svg = marker._icon.querySelector('.uav-icon svg');
+      if (!svg) return;
+      const angle = (typeof heading === 'number') ? heading : 0;
+      svg.style.transform = 'rotate(' + angle + 'deg)';
+  }
 
   function normalizePose(payload) {
       if (!payload) return null;
@@ -118,6 +248,7 @@ class FoliumMapProvider:
           if (headingFrom !== null && headingTo !== null) {
               const delta = angleDelta(headingFrom, headingTo);
               marker.__heading = headingFrom + delta * t;
+              updateUavRotation(marker, marker.__heading);
           }
           if (t < 1) {
               uavAnim.set(id, requestAnimationFrame(step));
@@ -135,15 +266,14 @@ class FoliumMapProvider:
       const heading = typeof pose.heading === 'number' ? pose.heading : null;
       let entry = uavMarkers.get(id);
       if (!entry) {
-          const marker = L.circleMarker([lat, lon], {
-              radius: 7,
-              color: '#000000',
-              fill: true,
-              fillColor: '#ffffff',
-              weight: 3
+          const marker = L.marker([lat, lon], {
+              icon: buildUavIcon(),
+              interactive: false
           }).addTo(map);
+          marker.setZIndexOffset(1000);
           entry = { marker, lat, lon, heading };
           uavMarkers.set(id, entry);
+          updateUavRotation(marker, heading);
           return;
       }
       const from = [entry.lat, entry.lon];
@@ -153,11 +283,15 @@ class FoliumMapProvider:
       entry.lat = lat;
       entry.lon = lon;
       entry.heading = heading;
+      updateUavRotation(entry.marker, headingTo);
       animateMarker(id, entry.marker, from, to, headingFrom, headingTo);
   }
 
   window.__mapTools = window.__mapTools || {};
   window.__mapTools.setUavPose = setUavPose;
+  window.__mapTools.setObjectSpawnMode = setObjectSpawnMode;
+  window.__mapTools.setHomeMode = setHomeMode;
+  window.__mapTools.screenToGeo = screenToGeo;
   if (window.__initialUavPose) {
       setUavPose(window.__initialUavPose);
   }
@@ -203,6 +337,8 @@ class FoliumMapProvider:
         center = path[0] if path else (56.02, 92.9)
         tiles_url, attr = self._tile_layer()
         telemetry = getattr(deps, "latest_telemetry", None)
+        mission_state = str(getattr(deps, "mission_state", "") or "")
+        show_drone = mission_state in ("IN_FLIGHT", "RTL")
         drone_pos = None
         heading = None
         if telemetry is not None and hasattr(telemetry, "lat") and hasattr(telemetry, "lon"):
@@ -267,18 +403,39 @@ class FoliumMapProvider:
                 tooltip="Finish",
             ).add_to(fmap)
 
-        if drone_pos:
+        if drone_pos and show_drone:
             heading = None
             if telemetry is not None and hasattr(telemetry, "yaw"):
                 try:
                     heading = float(telemetry.yaw)
                 except Exception:
                     heading = None
-            uav_id = str(getattr(settings, "uav_id", None) or "uav")
-            payload = json.dumps({"id": uav_id, "lat": drone_pos[0], "lon": drone_pos[1], "heading": heading})
+            uav_id = None
+            source = getattr(telemetry, "source", None) if telemetry is not None else None
+            if source:
+                uav_id = str(source)
+            if not uav_id:
+                uav_id = str(getattr(settings, "uav_id", None) or "uav")
+            payload = json.dumps(
+                {"id": uav_id, "lat": drone_pos[0], "lon": drone_pos[1], "heading": heading}
+            )
             fmap.get_root().html.add_child(
                 folium.Element(f"<script>window.__initialUavPose = {payload};</script>")
             )
+
+        home = getattr(deps, "home_location", None)
+        if isinstance(home, dict):
+            lat = home.get("lat")
+            lon = home.get("lon")
+            if lat is not None and lon is not None:
+                try:
+                    home_payload = json.dumps({"lat": float(lat), "lon": float(lon)})
+                except (TypeError, ValueError):
+                    home_payload = None
+                if home_payload:
+                    fmap.get_root().html.add_child(
+                        folium.Element(f"<script>window.__homeCoord = {home_payload};</script>")
+                    )
 
         if deps.debug_target:
             lat = deps.debug_target.get("lat")
@@ -293,45 +450,27 @@ class FoliumMapProvider:
                     weight=2,
                 ).add_to(fmap)
 
+        home = getattr(deps, "home_location", None)
+        if isinstance(home, dict):
+            lat = home.get("lat")
+            lon = home.get("lon")
+            if lat is not None and lon is not None:
+                folium.CircleMarker(
+                    location=(lat, lon),
+                    radius=7,
+                    color="#000000",
+                    fill=True,
+                    fill_color="#7bc6ff",
+                    weight=3,
+                    tooltip="Home",
+                ).add_to(fmap)
+
         if deps.debug_orbit_path and deps.debug_orbit_path != path:
             folium.PolyLine(
                 locations=[(lat, lon) for lat, lon in deps.debug_orbit_path],
                 color="orange",
                 weight=2,
             ).add_to(fmap)
-
-        objects = getattr(deps, "confirmed_objects", []) or []
-        selected_id = getattr(deps, "selected_object_id", None)
-        for obj in objects:
-            try:
-                lat = float(obj.get("lat"))
-                lon = float(obj.get("lon"))
-            except Exception:
-                continue
-            obj_id = str(obj.get("object_id", ""))
-            is_selected = bool(obj_id and obj_id == selected_id)
-            marker = folium.CircleMarker(
-                location=(lat, lon),
-                radius=6,
-                color="#000000",
-                fill=True,
-                fill_color="#ffffff",
-                weight=3 if is_selected else 2,
-                tooltip=f"Object {obj_id}" if obj_id else "Object",
-            ).add_to(fmap)
-            marker_name = marker.get_name()
-            payload = json.dumps({"object_id": obj_id, "lat": lat, "lon": lon})
-            fmap.get_root().html.add_child(
-                folium.Element(
-                    f"""
-<script>
-{marker_name}.on('click', function() {{
-  console.log('PY_OBJECT ' + JSON.stringify({payload}));
-}});
-</script>
-"""
-                )
-            )
 
         fmap.get_root().header.add_child(
             folium.Element(
@@ -487,6 +626,7 @@ class OpenLayersMapProvider:
         tiles_url, attr = self._tile_layer()
         css_url, js_url = self._asset_urls()
         telemetry = getattr(deps, "latest_telemetry", None)
+        mission_state = str(getattr(deps, "mission_state", "") or "")
         drone_pos = None
         heading = None
         if telemetry is not None and hasattr(telemetry, "lat") and hasattr(telemetry, "lon"):
@@ -501,6 +641,7 @@ class OpenLayersMapProvider:
                     heading = None
         if drone_pos is None:
             drone_pos = interpolate_path_point(path, getattr(deps, "debug_flight_progress", 0.0))
+        show_drone = mission_state in ("IN_FLIGHT", "RTL")
 
         path_coords = [[lon, lat] for lat, lon in path]
         path_done: list[list[float]] = []
@@ -569,9 +710,27 @@ class OpenLayersMapProvider:
                     "object_id": str(obj.get("object_id", "")),
                     "lat": lat,
                     "lon": lon,
+                    "selected": bool(obj.get("selected", False)),
                 }
             )
         selected_id = str(getattr(deps, "selected_object_id", "") or "")
+        home = getattr(deps, "home_location", None)
+        home_coord = None
+        if isinstance(home, dict):
+            lat = home.get("lat")
+            lon = home.get("lon")
+            if lat is not None and lon is not None:
+                try:
+                    home_coord = [float(lon), float(lat)]
+                except (TypeError, ValueError):
+                    home_coord = None
+
+        uav_id = None
+        source = getattr(telemetry, "source", None) if telemetry is not None else None
+        if source:
+            uav_id = str(source)
+        if not uav_id:
+            uav_id = str(getattr(settings, "uav_id", None) or "uav")
 
         payload = {
             "center": [float(center[1]), float(center[0])],
@@ -581,12 +740,13 @@ class OpenLayersMapProvider:
             "path_done": path_done,
             "path_remaining": path_remaining,
             "debug_orbit": debug_orbit_coords,
-            "drone": [float(drone_pos[1]), float(drone_pos[0])] if drone_pos else None,
-            "uav_id": str(getattr(settings, "uav_id", None) or "uav"),
+            "drone": [float(drone_pos[1]), float(drone_pos[0])] if (drone_pos and show_drone) else None,
+            "uav_id": uav_id,
             "heading": heading,
             "target": target,
             "objects": objects,
             "selected_id": selected_id,
+            "home": home_coord,
             "radius_px": self._radius_px,
             "route_stats": self._route_stats_payload(path, telemetry),
         }
@@ -695,6 +855,13 @@ class OpenLayersMapProvider:
           radius: 6,
           fill: new ol.style.Fill({{ color: '#ffffff' }}),
           stroke: new ol.style.Stroke({{ color: '#000000', width: 2 }})
+        }})
+      }}),
+      home: new ol.style.Style({{
+        image: new ol.style.Circle({{
+          radius: 7,
+          fill: new ol.style.Fill({{ color: '#7bc6ff' }}),
+          stroke: new ol.style.Stroke({{ color: '#000000', width: 3 }})
         }})
       }}),
       object: new ol.style.Style({{
@@ -844,6 +1011,9 @@ class OpenLayersMapProvider:
         return styles.drone;
       }}
       if (kind === 'object') {{
+        const selected = feature.get('selected');
+        if (selected === true) return styles.objectSelected;
+        if (selected === false) return styles.object;
         const objectId = feature.get('object_id') || '';
         return objectId && objectId === data.selected_id ? styles.objectSelected : styles.object;
       }}
@@ -874,12 +1044,21 @@ class OpenLayersMapProvider:
         mapOptions.controls = ol.control.defaults({{ attribution: false }});
       }}
       const map = new ol.Map(mapOptions);
+      window.screenToGeo = function(x, y) {{
+        if (!map) return null;
+        const coord = map.getCoordinateFromPixel([x, y]);
+        if (!coord) return null;
+        const lonLat = ol.proj.toLonLat(coord);
+        return {{ lat: lonLat[1], lon: lonLat[0] }};
+      }};
 
     const geojson = new ol.format.GeoJSON();
     let suppressEmit = true;
 
     const uavStates = new Map();
     const uavAnims = new Map();
+    let spawnMode = false;
+    let homeMode = false;
 
     function normalizePose(payload) {{
       if (!payload) return null;
@@ -1002,6 +1181,24 @@ class OpenLayersMapProvider:
       toRemove.forEach(f => overlaySource.removeFeature(f));
     }}
 
+    function setObjects(objects) {{
+      removeOverlayKinds(['object']);
+      if (!Array.isArray(objects)) return;
+      objects.forEach(obj => {{
+        if (!obj) return;
+        const lat = Number(obj.lat);
+        const lon = Number(obj.lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+        addOverlayPoint([lon, lat], 'object', {{
+          object_id: obj.object_id || '',
+          lat,
+          lon,
+          selected: obj.selected === true
+        }});
+      }});
+    }}
+
+
     function lineCoordsFromFeature(feature) {{
       if (!feature) return [];
       const geom = feature.getGeometry();
@@ -1054,6 +1251,25 @@ class OpenLayersMapProvider:
       }}
     }}
 
+    const frameScheduler = window.requestAnimationFrame
+      ? window.requestAnimationFrame.bind(window)
+      : (cb) => window.setTimeout(cb, 16);
+    let segmentOverlayHandle = null;
+    let pendingSegmentOverlayCoords = null;
+
+    function scheduleSegmentOverlayUpdate(coords) {{
+      pendingSegmentOverlayCoords = Array.isArray(coords) ? coords.slice() : [];
+      if (segmentOverlayHandle !== null) {{
+        return;
+      }}
+      segmentOverlayHandle = frameScheduler(() => {{
+        segmentOverlayHandle = null;
+        const coordsToUpdate = pendingSegmentOverlayCoords;
+        pendingSegmentOverlayCoords = null;
+        updateSegmentOverlays(coordsToUpdate);
+      }});
+    }}
+
     function getLineFeature() {{
       return drawSource.getFeatures().find(f => f.getGeometry().getType() === 'LineString');
     }}
@@ -1100,6 +1316,9 @@ class OpenLayersMapProvider:
     addOverlayLine(data.path_done, 'pathDone');
     addOverlayLine(data.path_remaining, 'pathRemaining');
     addOverlayLine(data.debug_orbit, 'orbit');
+    if (data.home && data.home.length >= 2) {{
+      addOverlayPoint(data.home, 'home');
+    }}
     if (data.drone && data.drone.length >= 2) {{
       setUavPose({{
         id: data.uav_id || 'uav',
@@ -1110,10 +1329,15 @@ class OpenLayersMapProvider:
     }}
 
     (data.objects || []).forEach(obj => {{
-      addOverlayPoint([obj.lon, obj.lat], 'object', {{
-        object_id: obj.object_id,
-        lat: obj.lat,
-        lon: obj.lon
+      if (!obj) return;
+      const lat = Number(obj.lat);
+      const lon = Number(obj.lon);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+      addOverlayPoint([lon, lat], 'object', {{
+        object_id: obj.object_id || '',
+        lat,
+        lon,
+        selected: obj.selected === true
       }});
     }});
 
@@ -1154,6 +1378,21 @@ class OpenLayersMapProvider:
     }}
 
     let isClamping = false;
+    let isSnapping = false;
+    const homeSnapCoord = Array.isArray(data.home) && data.home.length >= 2 ? data.home : null;
+    const homeSnapThresholdM = 100.0;
+
+    function maybeSnapToHome(coords) {{
+      if (!homeSnapCoord || !coords || !coords.length) return coords;
+      if (appendMode) return coords;
+      const first = coords[0];
+      if (!first) return coords;
+      if (haversineM(first, homeSnapCoord) > homeSnapThresholdM) return coords;
+      if (first[0] === homeSnapCoord[0] && first[1] === homeSnapCoord[1]) return coords;
+      const snapped = coords.slice();
+      snapped[0] = [homeSnapCoord[0], homeSnapCoord[1]];
+      return snapped;
+    }}
 
     function watchLine(feature) {{
       unwatchLine();
@@ -1161,15 +1400,20 @@ class OpenLayersMapProvider:
       const geom = feature.getGeometry();
       if (!geom) return;
       liveGeomKey = geom.on('change', () => {{
-        if (isClamping) return;
+        if (isClamping || isSnapping) return;
         const coords = lineCoordsFromFeature(feature);
+        let nextCoords = coords;
         const clamped = clampPathToBattery(coords);
         if (clamped && clamped.length >= 2 && JSON.stringify(clamped) !== JSON.stringify(coords)) {{
-          isClamping = true;
-          geom.setCoordinates(clamped.map(c => ol.proj.fromLonLat(c)));
-          isClamping = false;
+          nextCoords = clamped;
         }}
-        updateSegmentOverlays(lineCoordsFromFeature(feature));
+        nextCoords = maybeSnapToHome(nextCoords);
+        if (JSON.stringify(nextCoords) !== JSON.stringify(coords)) {{
+          isSnapping = true;
+          geom.setCoordinates(nextCoords.map(c => ol.proj.fromLonLat(c)));
+          isSnapping = false;
+        }}
+        scheduleSegmentOverlayUpdate(nextCoords);
       }});
     }}
 
@@ -1214,13 +1458,14 @@ class OpenLayersMapProvider:
             merged.push(...coords);
           }}
           coords = merged;
-          if (geom) {{
-            geom.setCoordinates(coords.map(c => ol.proj.fromLonLat(c)));
-          }}
         }}
+        coords = maybeSnapToHome(coords);
         const clamped = clampPathToBattery(coords);
         if (geom && clamped && clamped.length >= 2 && JSON.stringify(clamped) !== JSON.stringify(coords)) {{
-          geom.setCoordinates(clamped.map(c => ol.proj.fromLonLat(c)));
+          coords = clamped;
+        }}
+        if (geom) {{
+          geom.setCoordinates(coords.map(c => ol.proj.fromLonLat(c)));
         }}
       }}
       const keep = evt && evt.feature ? evt.feature : null;
@@ -1338,6 +1583,16 @@ class OpenLayersMapProvider:
       setAppendMode: (flag) => {{
         appendMode = !!flag;
       }},
+      setObjectSpawnMode: (flag) => {{
+        spawnMode = !!flag;
+      }},
+      setObjects: (objects) => {{
+        setObjects(objects);
+      }},
+      setHomeMode: (flag) => {{
+        homeMode = !!flag;
+      }},
+      screenToGeo: (x, y) => (window.screenToGeo ? window.screenToGeo(x, y) : null),
       removeLastPoint: () => removeLastPoint(),
       clearPath: () => {{
         removeByType('LineString');
@@ -1352,6 +1607,19 @@ class OpenLayersMapProvider:
 
     map.on('singleclick', evt => {{
       if (drawInteraction) return;
+      if (homeMode) {{
+        const lonLat = ol.proj.toLonLat(evt.coordinate);
+        const payload = {{
+          lat: lonLat[1],
+          lon: lonLat[0]
+        }};
+        console.log('PY_HOME ' + JSON.stringify(payload));
+        homeMode = false;
+        return;
+      }}
+      if (spawnMode) {{
+        return;
+      }}
       map.forEachFeatureAtPixel(evt.pixel, feature => {{
         if (feature.get('kind') === 'object') {{
           const lonLat = ol.proj.toLonLat(feature.getGeometry().getCoordinates());
@@ -1422,6 +1690,7 @@ class StaticImageMapProvider:
         center = ((lat_min + lat_max) / 2.0, (lon_min + lon_max) / 2.0)
         bounds = [[lat_min, lon_min], [lat_max, lon_max]]
         telemetry = getattr(deps, "latest_telemetry", None)
+        mission_state = str(getattr(deps, "mission_state", "") or "")
         drone_pos = None
         if telemetry is not None and hasattr(telemetry, "lat") and hasattr(telemetry, "lon"):
             try:
@@ -1430,6 +1699,7 @@ class StaticImageMapProvider:
                 drone_pos = None
         if drone_pos is None:
             drone_pos = interpolate_path_point(path, getattr(deps, "debug_flight_progress", 0.0))
+        show_drone = mission_state in ("IN_FLIGHT", "RTL")
 
         fmap = folium.Map(
             center,
@@ -1486,15 +1756,22 @@ class StaticImageMapProvider:
                 tooltip="Finish",
             ).add_to(fmap)
 
-        if drone_pos:
+        if drone_pos and show_drone:
             heading = None
             if telemetry is not None and hasattr(telemetry, "yaw"):
                 try:
                     heading = float(telemetry.yaw)
                 except Exception:
                     heading = None
-            uav_id = str(getattr(settings, "uav_id", None) or "uav")
-            payload = json.dumps({"id": uav_id, "lat": drone_pos[0], "lon": drone_pos[1], "heading": heading})
+            uav_id = None
+            source = getattr(telemetry, "source", None) if telemetry is not None else None
+            if source:
+                uav_id = str(source)
+            if not uav_id:
+                uav_id = str(getattr(settings, "uav_id", None) or "uav")
+            payload = json.dumps(
+                {"id": uav_id, "lat": drone_pos[0], "lon": drone_pos[1], "heading": heading}
+            )
             fmap.get_root().html.add_child(
                 folium.Element(f"<script>window.__initialUavPose = {payload};</script>")
             )
@@ -1518,39 +1795,6 @@ class StaticImageMapProvider:
                 color="orange",
                 weight=2,
             ).add_to(fmap)
-
-        objects = getattr(deps, "confirmed_objects", []) or []
-        selected_id = getattr(deps, "selected_object_id", None)
-        for obj in objects:
-            try:
-                lat = float(obj.get("lat"))
-                lon = float(obj.get("lon"))
-            except Exception:
-                continue
-            obj_id = str(obj.get("object_id", ""))
-            is_selected = bool(obj_id and obj_id == selected_id)
-            marker = folium.CircleMarker(
-                location=(lat, lon),
-                radius=6,
-                color="#000000",
-                fill=True,
-                fill_color="#ffffff",
-                weight=3 if is_selected else 2,
-                tooltip=f"Object {obj_id}" if obj_id else "Object",
-            ).add_to(fmap)
-            marker_name = marker.get_name()
-            payload = json.dumps({"object_id": obj_id, "lat": lat, "lon": lon})
-            fmap.get_root().html.add_child(
-                folium.Element(
-                    f"""
-<script>
-{marker_name}.on('click', function() {{
-  console.log('PY_OBJECT ' + JSON.stringify({payload}));
-}});
-</script>
-"""
-                )
-            )
 
         fmap.get_root().header.add_child(
             folium.Element(

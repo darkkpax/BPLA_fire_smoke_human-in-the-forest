@@ -1,0 +1,3 @@
+{"timestamp": "2026-01-18T10:34:43.253043Z", "event": "flight_session_started", "payload": {"started_at": "2026-01-18T10:34:43.240538Z", "plan": [[56.01419000806595, 92.84363828059638], [56.02880544494923, 92.84407860046602], [56.02763637909683, 92.87566023596199], [56.02552083576094, 92.87605874542476]]}}
+{"timestamp": "2026-01-18T10:34:55.591466Z", "event": "mission_state_changed", "payload": {"state": "RTL", "reason": "operator_rtl"}}
+{"timestamp": "2026-01-18T10:35:08.459794Z", "event": "flight_session_ended", "payload": {"ended_at": "2026-01-18T10:35:08.459794Z", "reason": "operator_abort"}}

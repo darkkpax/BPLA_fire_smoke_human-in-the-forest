@@ -1,0 +1,42 @@
+{"timestamp": "2026-01-10T17:22:16.192777Z", "event": "flight_session_started", "payload": {"started_at": "2026-01-10T17:22:16.180763Z", "plan": [[56.01424304247311, 92.84283676147463], [56.0420603884472, 92.85227813720704], [56.02997669367505, 92.88455047607422], [56.022398479039936, 92.87098922729494]]}}
+{"timestamp": "2026-01-10T17:22:56.056860Z", "event": "mission_state_changed", "payload": {"state": "RTL", "reason": "operator_rtl"}}
+{"timestamp": "2026-01-10T17:23:02.787594Z", "event": "flight_session_ended", "payload": {"ended_at": "2026-01-10T17:23:02.787594Z", "reason": "operator_abort"}}
+{"timestamp": "2026-01-10T17:23:02.788597Z", "event": "mission_state_changed", "payload": {"state": "PREFLIGHT", "reason": "operator_abort"}}
+{"timestamp": "2026-01-10T17:23:08.305272Z", "event": "mission_state_changed", "payload": {"state": "READY", "reason": "plan_confirmed"}}
+{"timestamp": "2026-01-10T17:23:08.305272Z", "event": "mission_state_changed", "payload": {"state": "IN_FLIGHT", "reason": "start_flight"}}
+{"timestamp": "2026-01-10T17:23:11.212128Z", "event": "mission_state_changed", "payload": {"state": "RTL", "reason": "operator_rtl"}}
+{"timestamp": "2026-01-10T17:23:12.422305Z", "event": "mission_state_changed", "payload": {"state": "POSTFLIGHT", "reason": "operator_land"}}
+{"timestamp": "2026-01-10T17:23:12.424303Z", "event": "flight_session_ended", "payload": {"ended_at": "2026-01-10T17:23:12.424303Z", "reason": "operator_land"}}
+{"timestamp": "2026-01-10T17:23:13.764105Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:13.874158Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:13.983868Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:14.092934Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:14.203569Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:14.319028Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:14.423546Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:14.533661Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:14.640429Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:14.752457Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:14.863759Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:14.969856Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:15.081685Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:15.189768Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:15.298430Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:15.408648Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:15.515468Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:15.624346Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:15.733468Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:15.843131Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:15.954185Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:16.061493Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:16.171868Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:16.283842Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:16.287718Z", "event": "mission_state_changed", "payload": {"state": "PREFLIGHT", "reason": "postflight_reset"}}
+{"timestamp": "2026-01-10T17:23:16.393498Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:16.503308Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:16.608940Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:16.717764Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:16.828522Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:16.936758Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:17.047600Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}
+{"timestamp": "2026-01-10T17:23:17.159577Z", "event": "warning_toast", "payload": {"key": "route_energy_insufficient", "message": "Insufficient battery for return to home", "severity": "warn", "cooldown_s": 8}}

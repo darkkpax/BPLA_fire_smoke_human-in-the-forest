@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -106,7 +106,7 @@ class FlightRecorder:
         )
         summary_path = self._session_dir / "summary.json"
         summary_path.write_text(
-            json.dumps(summary.__dict__, indent=2, ensure_ascii=False), encoding="utf-8"
+            json.dumps(asdict(summary), indent=2, ensure_ascii=False), encoding="utf-8"
         )
         self.last_summary = summary
         self._close_files()

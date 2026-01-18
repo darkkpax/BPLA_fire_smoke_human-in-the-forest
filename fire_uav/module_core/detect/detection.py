@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Sequence, cast
 
 import numpy as np
-import torch
 from numpy.typing import NDArray
 
 from fire_uav.config.settings import settings
@@ -19,6 +18,11 @@ from fire_uav.module_core.schema import Detection, DetectionsBatch, FrameMeta
 
 if TYPE_CHECKING:
     from ultralytics.engine.results import Results
+
+try:
+    import torch
+except Exception:  # pragma: no cover
+    torch = None
 
 try:
     from ultralytics import YOLO as _YOLO
@@ -44,6 +48,8 @@ class DetectionEngine:
     ) -> None:
         if YOLO is None:  # pragma: no cover
             raise RuntimeError("Install `ultralytics` to use DetectionEngine")
+        if torch is None:  # pragma: no cover
+            raise RuntimeError("Install `torch` to use DetectionEngine")
 
         model_path = model_path or settings.yolo_model
         conf_threshold = conf_threshold or settings.yolo_conf

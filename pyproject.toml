@@ -7,6 +7,42 @@ name = "fire-uav"
 version = "0.1.0"
 description = "Fire-smoke-human detection UAV toolkit"
 requires-python = ">=3.10"
+# Core runtime deps (non-GUI)
+dependencies = [
+    "pydantic>=2.12",
+    "numpy>=1.26",
+    "shapely>=2.0",
+    "ortools>=9.14",
+    "httpx>=0.28",
+    "requests>=2.32",
+    "prometheus-client>=0.23",
+]
+
+[project.optional-dependencies]
+module = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "orjson>=3.9",
+    "prometheus-fastapi-instrumentator>=7.1",
+    "opencv-python-headless>=4.10",
+]
+detect = [
+    "ultralytics>=8.3",
+    "torch>=2.4",
+]
+ground = [
+    "PySide6>=6.7",
+    "PySide6-Addons>=6.7",
+    "PySide6-Essentials>=6.7",
+    "folium>=0.20",
+    "branca>=0.8",
+    "opencv-python-headless>=4.10",
+]
+dev = [
+    "pytest>=8.2",
+    "ruff>=0.6",
+    "mypy>=1.16",
+]
 # если есть внешние зависимости – перечислите их здесь
 # dependencies = ["opencv-python", "pydantic", ...]
 

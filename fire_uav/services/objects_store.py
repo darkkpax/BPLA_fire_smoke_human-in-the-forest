@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
 
 from fire_uav.services.bus import Event, bus
-
 
 @dataclass(slots=True)
 class ConfirmedObject:
@@ -17,6 +17,8 @@ class ConfirmedObject:
     track_id: int | None
     timestamp: datetime | None
 
+
+log = logging.getLogger(__name__)
 
 class ConfirmedObjectsStore:
     def __init__(self, on_change: Callable[[], None] | None = None) -> None:
@@ -48,6 +50,13 @@ class ConfirmedObjectsStore:
             return None
         return self._objects.get(self._order[-1])
 
+    def clear(self) -> None:
+        self._objects.clear()
+        self._order.clear()
+        self._selected_id = None
+        if self._on_change:
+            self._on_change()
+
     # ------------------------------------------------------------------ #
     def _on_confirmed(self, payload: object) -> None:
         if not isinstance(payload, dict):
@@ -68,6 +77,12 @@ class ConfirmedObjectsStore:
         self._objects[object_id] = obj
         if is_new:
             self._order.append(object_id)
+            if object_id.startswith("manual-"):
+                log.info(
+                    "MANUAL_SPAWN stored id=%s total=%s",
+                    object_id,
+                    self.count(),
+                )
         if self._on_change:
             self._on_change()
 

@@ -2,6 +2,26 @@
 
 **Fire Smoke Human Detection & UAV Mission Planning**
 
+## Headless install (pip)
+```bash
+pip install -e ".[module]"
+pip install -e ".[module,detect]"
+python -m fire_uav.module_app.main_module
+```
+
+## Environment check
+```bash
+python -m fire_uav.tools.env_check --profile module
+python -m fire_uav.tools.env_check --profile module,detect
+```
+
+## Local checks
+```bash
+pytest -q
+python -m fire_uav.tools.env_check --profile module
+python -m fire_uav.tools.env_check --profile module,detect
+```
+
 Инструментарий для обнаружения дыма/огня/людей и планирования миссий БПЛА. Используются Ultralytics YOLOv11 (PyTorch), OR-Tools + Shapely для маршрутов, FastAPI для REST, и GUI на PySide6/Qt WebEngine.
 
 ```powershell

@@ -1,4 +1,4 @@
-.PHONY: install dev test lint run-ground run-module-unreal run-bridge fmt
+.PHONY: install dev test lint run-ground run-module-unreal run-bridge fmt check-env check-env-detect
 
 PY := poetry run
 
@@ -10,6 +10,12 @@ dev:
 
 test:
 	$(PY) pytest
+
+check-env:
+	$(PY) python -m fire_uav.tools.env_check --profile module
+
+check-env-detect:
+	$(PY) python -m fire_uav.tools.env_check --profile module,detect
 
 lint:
 	$(PY) black --check .

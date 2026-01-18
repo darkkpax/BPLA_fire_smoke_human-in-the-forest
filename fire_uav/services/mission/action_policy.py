@@ -35,11 +35,14 @@ class MissionActionPolicy:
         supports_waypoints: bool,
         supports_orbit: bool,
         supports_rtl: bool,
+        telemetry_available: bool,
+        at_home: bool,
     ) -> "MissionActionPolicy":
         can_confirm_plan = (
             mission_state in (MissionState.PREFLIGHT, MissionState.READY)
             and not has_confirmed_plan
             and supports_waypoints
+            and telemetry_available
         )
         can_start_flight = (
             mission_state in (MissionState.PREFLIGHT, MissionState.READY)
@@ -69,7 +72,7 @@ class MissionActionPolicy:
         )
         can_rtl = mission_state == MissionState.IN_FLIGHT and commands_enabled and link_ok and supports_rtl
         can_send_rtl_route = mission_state == MissionState.RTL and link_ok and supports_waypoints
-        can_complete_landing = mission_state == MissionState.RTL
+        can_complete_landing = mission_state == MissionState.RTL and at_home
         can_abort_to_preflight = mission_state in (MissionState.IN_FLIGHT, MissionState.RTL)
         return cls(
             can_confirm_plan=can_confirm_plan,

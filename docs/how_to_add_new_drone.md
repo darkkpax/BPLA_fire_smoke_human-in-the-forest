@@ -1,26 +1,26 @@
-# How to add a new drone
+# Как добавить новый дрон
 
-This guide explains how to plug a new UAV into Skysight using the contract v1 models and driver registry.
+Это руководство объясняет, как подключить новый БПЛА к Skysight, используя модели контракта v1 и реестр драйверов.
 
-## Steps
-1) Implement the driver interface
-   - Copy `fire_uav/module_core/drivers/templates/new_driver_template.py`.
-   - Map the drone's telemetry into `TelemetryV1` and call the ingest callback.
-   - Map routes and commands into the drone's protocol.
+## Шаги
+1) Реализуйте интерфейс драйвера
+   - Скопируйте `fire_uav/module_core/drivers/templates/new_driver_template.py`.
+   - Смаппьте телеметрию дрона в `TelemetryV1` и вызовите ingest-callback.
+   - Смаппьте маршруты и команды в протокол дрона.
 
-2) Map telemetry/route to the contract models
-   - Use `fire_uav/module_core/contract/mappers.py` to convert between `TelemetryV1`/`RouteV1` and internal models.
-   - Populate optional fields like `battery_percent` and `gps_fix` when available.
+2) Сопоставьте телеметрию/маршрут с контрактными моделями
+   - Используйте `fire_uav/module_core/contract/mappers.py`, чтобы конвертировать между `TelemetryV1`/`RouteV1` и внутренними моделями.
+   - Заполняйте опциональные поля вроде `battery_percent` и `gps_fix`, когда они доступны.
 
-3) Register the driver
-   - Add the driver to `fire_uav/module_core/drivers/registry.py`.
-   - Pick a `driver_type` name (example: `"client_bridge"`).
+3) Зарегистрируйте драйвер
+   - Добавьте драйвер в `fire_uav/module_core/drivers/registry.py`.
+   - Выберите имя `driver_type` (пример: `"client_bridge"`).
 
-4) Configure settings
-   - Update `fire_uav/config/settings_default.json` with `driver_type`.
-   - Or override with your runtime settings file.
+4) Настройте конфигурацию
+   - Обновите `fire_uav/config/settings_default.json`, указав `driver_type`.
+   - Или переопределите настройкой в вашем runtime-файле.
 
-5) Verify monitors and mission pipeline
-   - Ensure link and camera readiness events update correctly.
-   - Confirm mission state transitions (preflight -> in_flight -> rtl -> postflight).
-   - Validate that the route polling endpoint returns the expected mission route.
+5) Проверьте мониторы и пайплайн миссии
+   - Убедитесь, что события готовности линка и камеры обновляются корректно.
+   - Проверьте переходы состояний миссии (preflight -> in_flight -> rtl -> postflight).
+   - Убедитесь, что эндпоинт опроса маршрута возвращает ожидаемый маршрут миссии.
