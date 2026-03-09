@@ -1,7 +1,9 @@
 # mypy: ignore-errors
 from __future__ import annotations
 
+import base64
 import json
+import logging
 import tempfile
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -13,12 +15,20 @@ from fire_uav.config import settings
 from fire_uav.core.protocol import MapBounds
 from fire_uav.module_core.geometry import haversine_m, interpolate_path_point
 
+log = logging.getLogger(__name__)
+
+
+def _spawn_debug_visuals_enabled() -> bool:
+    """Hide temporary spawn/debug overlays by default while keeping logic active."""
+    return bool(getattr(settings, "show_spawn_debug_visuals", False))
 
 @runtime_checkable
 class MapProvider(Protocol):
     """Protocol for interchangeable map backends."""
 
-    def render_map(self, path: list[tuple[float, float]], token: int) -> Path: ...
+    def render_map(
+        self, path: list[tuple[float, float]], token: int, path_kind: str | None = None
+    ) -> Path: ...
     @property
     def bridge_script(self) -> str: ...
     def set_provider(self, provider: str, *, offline: bool, cache_dir: Path | None) -> None: ...
@@ -40,8 +50,8 @@ class FoliumMapProvider:
     _BRIDGE_JS = """\
 (() => {
   if (!window.L) { console.error('Leaflet failed to load'); return; }
-  const map = Object.values(window).find(v => v instanceof L.Map);
-  if (!map) { console.error('Map instance not found'); return; }
+  const map = window.__map || Object.values(window).find(v => v instanceof L.Map);
+  if (!map) { return; }
 
   function sendPath(gj) { console.log('PY_PATH ' + JSON.stringify(gj)); }
   function sendTarget(gj) { console.log('PY_TARGET ' + JSON.stringify(gj)); }
@@ -333,7 +343,9 @@ class FoliumMapProvider:
         url, attr = self.TILESETS.get(self._provider, self.TILESETS["de"])
         return url, attr
 
-    def render_map(self, path: list[tuple[float, float]], token: int) -> Path:
+    def render_map(
+        self, path: list[tuple[float, float]], token: int, path_kind: str | None = None
+    ) -> Path:
         center = path[0] if path else (56.02, 92.9)
         tiles_url, attr = self._tile_layer()
         telemetry = getattr(deps, "latest_telemetry", None)
@@ -359,6 +371,10 @@ class FoliumMapProvider:
             prefer_canvas=True,
             tiles=None,
             attributionControl=False,
+        )
+
+        fmap.get_root().script.add_child(
+            folium.Element(f"window.__map = {fmap.get_name()};")
         )
 
         folium.raster_layers.TileLayer(
@@ -403,6 +419,26 @@ class FoliumMapProvider:
                 tooltip="Finish",
             ).add_to(fmap)
 
+        anchor = getattr(deps, "route_edit_anchor", None)
+        if mission_state == "IN_FLIGHT" and isinstance(anchor, dict):
+            lat = anchor.get("lat")
+            lon = anchor.get("lon")
+            if lat is not None and lon is not None:
+                try:
+                    anchor_loc = (float(lat), float(lon))
+                except (TypeError, ValueError):
+                    anchor_loc = None
+                if anchor_loc is not None:
+                    folium.CircleMarker(
+                        location=anchor_loc,
+                        radius=7,
+                        color="#000000",
+                        fill=True,
+                        fill_color="#ffffff",
+                        weight=2,
+                        tooltip="Edit start",
+                    ).add_to(fmap)
+
         if drone_pos and show_drone:
             heading = None
             if telemetry is not None and hasattr(telemetry, "yaw"):
@@ -437,7 +473,7 @@ class FoliumMapProvider:
                         folium.Element(f"<script>window.__homeCoord = {home_payload};</script>")
                     )
 
-        if deps.debug_target:
+        if _spawn_debug_visuals_enabled() and deps.debug_target:
             lat = deps.debug_target.get("lat")
             lon = deps.debug_target.get("lon")
             if lat is not None and lon is not None:
@@ -465,7 +501,7 @@ class FoliumMapProvider:
                     tooltip="Home",
                 ).add_to(fmap)
 
-        if deps.debug_orbit_path and deps.debug_orbit_path != path:
+        if _spawn_debug_visuals_enabled() and deps.debug_orbit_path and deps.debug_orbit_path != path:
             folium.PolyLine(
                 locations=[(lat, lon) for lat, lon in deps.debug_orbit_path],
                 color="orange",
@@ -519,12 +555,16 @@ class OpenLayersMapProvider:
         *,
         offline: bool = False,
         cache_dir: Path | None = None,
+        static_image_path: str | None = None,
+        static_bounds: MapBounds | None = None,
     ) -> None:
         self._map_path: Path = Path(tempfile.gettempdir()) / "plan_map.html"
         self._radius_px = 18  # match QML card radius
         self._provider = self._normalize_provider(provider)
         self._offline = offline
         self._cache_dir = cache_dir
+        self._static_image_path = static_image_path
+        self._static_bounds = static_bounds
 
     @property
     def bridge_script(self) -> str:
@@ -621,7 +661,9 @@ class OpenLayersMapProvider:
             "base": base_lonlat,
         }
 
-    def render_map(self, path: list[tuple[float, float]], token: int) -> Path:
+    def render_map(
+        self, path: list[tuple[float, float]], token: int, path_kind: str | None = None
+    ) -> Path:
         center = path[0] if path else (56.02, 92.9)
         tiles_url, attr = self._tile_layer()
         css_url, js_url = self._asset_urls()
@@ -688,11 +730,13 @@ class OpenLayersMapProvider:
                         break
             path_done = [[lon, lat] for lat, lon in done_pts]
             path_remaining = [[lon, lat] for lat, lon in remaining_pts]
-        debug_orbit_coords = [
-            [lon, lat] for lat, lon in (getattr(deps, "debug_orbit_path", []) or [])
-        ]
+        debug_orbit_coords = []
+        if _spawn_debug_visuals_enabled():
+            debug_orbit_coords = [
+                [lon, lat] for lat, lon in (getattr(deps, "debug_orbit_path", []) or [])
+            ]
         target = None
-        if deps.debug_target:
+        if _spawn_debug_visuals_enabled() and deps.debug_target:
             lat = deps.debug_target.get("lat")
             lon = deps.debug_target.get("lon")
             if lat is not None and lon is not None:
@@ -732,11 +776,17 @@ class OpenLayersMapProvider:
         if not uav_id:
             uav_id = str(getattr(settings, "uav_id", None) or "uav")
 
+        resolved_path_kind = path_kind if path_kind in ("mission", "maneuver") else None
+        if resolved_path_kind is None:
+            active_kind = getattr(deps, "active_path_kind", "mission")
+            resolved_path_kind = active_kind if active_kind in ("mission", "maneuver") else "mission"
+
         payload = {
             "center": [float(center[1]), float(center[0])],
             "tiles_url": tiles_url,
             "attribution": attr,
             "path": path_coords,
+            "path_kind": resolved_path_kind,
             "path_done": path_done,
             "path_remaining": path_remaining,
             "debug_orbit": debug_orbit_coords,
@@ -750,6 +800,19 @@ class OpenLayersMapProvider:
             "radius_px": self._radius_px,
             "route_stats": self._route_stats_payload(path, telemetry),
         }
+        if self._static_image_path and self._static_bounds:
+            image_url = None
+            try:
+                image_url = Path(self._static_image_path).expanduser().resolve().as_uri()
+            except Exception:
+                image_url = str(self._static_image_path)
+            payload["static_image"] = image_url
+            payload["static_bounds"] = {
+                "lat_min": float(self._static_bounds.lat_min),
+                "lon_min": float(self._static_bounds.lon_min),
+                "lat_max": float(self._static_bounds.lat_max),
+                "lon_max": float(self._static_bounds.lon_max),
+            }
 
         html = f"""\
 <!doctype html>
@@ -797,20 +860,33 @@ class OpenLayersMapProvider:
         return;
       }}
       const data = {json.dumps(payload)};
-      const tileSource = new ol.source.XYZ({{
-        url: data.tiles_url,
-        attributions: data.attribution
-      }});
-      tileSource.on('tileloaderror', () => {{
-        console.error('Tile load failed');
-      }});
-
       const view = new ol.View({{
         center: ol.proj.fromLonLat(data.center),
         zoom: 13
       }});
 
-      const tileLayer = new ol.layer.Tile({{ source: tileSource }});
+      let baseLayer = null;
+      let staticExtent = null;
+      if (data.static_image && data.static_bounds) {{
+        const sw = ol.proj.fromLonLat([data.static_bounds.lon_min, data.static_bounds.lat_min]);
+        const ne = ol.proj.fromLonLat([data.static_bounds.lon_max, data.static_bounds.lat_max]);
+        staticExtent = [sw[0], sw[1], ne[0], ne[1]];
+        const imageSource = new ol.source.ImageStatic({{
+          url: data.static_image,
+          imageExtent: staticExtent,
+          projection: view.getProjection()
+        }});
+        baseLayer = new ol.layer.Image({{ source: imageSource }});
+      }} else {{
+        const tileSource = new ol.source.XYZ({{
+          url: data.tiles_url,
+          attributions: data.attribution
+        }});
+        tileSource.on('tileloaderror', () => {{
+          console.error('Tile load failed');
+        }});
+        baseLayer = new ol.layer.Tile({{ source: tileSource }});
+      }}
       const drawSource = new ol.source.Vector();
       const overlaySource = new ol.source.Vector();
 
@@ -881,6 +957,7 @@ class OpenLayersMapProvider:
     }};
 
     const routeStats = data.route_stats || {{}};
+    const pathKind = data.path_kind === 'maneuver' ? 'maneuver' : 'mission';
     const maxDistanceM = typeof routeStats.max_distance_m === 'number' ? routeStats.max_distance_m : 0;
     const reservedPercent = typeof routeStats.reserved_percent === 'number' ? routeStats.reserved_percent : 0;
     const availablePercent = typeof routeStats.available_percent === 'number' ? routeStats.available_percent : 100;
@@ -1037,13 +1114,16 @@ class OpenLayersMapProvider:
 
       const mapOptions = {{
         target: 'map',
-        layers: [tileLayer, drawLayer, overlayLayer],
+        layers: [baseLayer, drawLayer, overlayLayer],
         view
       }};
       if (ol.control && typeof ol.control.defaults === 'function') {{
         mapOptions.controls = ol.control.defaults({{ attribution: false }});
       }}
       const map = new ol.Map(mapOptions);
+      if (staticExtent) {{
+        view.fit(staticExtent, {{ padding: [24, 24, 24, 24], size: map.getSize() }});
+      }}
       window.screenToGeo = function(x, y) {{
         if (!map) return null;
         const coord = map.getCoordinateFromPixel([x, y]);
@@ -1206,9 +1286,10 @@ class OpenLayersMapProvider:
       return geom.getCoordinates().map(c => ol.proj.toLonLat(c));
     }}
 
-    function updateSegmentOverlays(coords) {{
+    function updateSegmentOverlays(coords, kind) {{
       removeOverlayKinds(['segment', 'segmentLabel']);
       if (!coords || coords.length < 2) return;
+      const showSegmentLabels = kind !== 'maneuver';
       let cumulative = 0;
       function offsetLabelPoint(a, b, meters) {{
         const mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
@@ -1240,7 +1321,7 @@ class OpenLayersMapProvider:
         const displayRemaining = remaining === null ? null : clamp(remaining, 0, 100);
         const label = displayRemaining === null ? null : `${{displayRemaining.toFixed(1)}}%`;
         addOverlayLine([a, b], 'segment', {{ remaining: displayRemaining }});
-        if (label) {{
+        if (showSegmentLabels && label) {{
           addOverlayPoint(offsetLabelPoint(a, b, 32), 'segmentLabel', {{
             label,
             remaining: displayRemaining,
@@ -1266,7 +1347,7 @@ class OpenLayersMapProvider:
         segmentOverlayHandle = null;
         const coordsToUpdate = pendingSegmentOverlayCoords;
         pendingSegmentOverlayCoords = null;
-        updateSegmentOverlays(coordsToUpdate);
+        updateSegmentOverlays(coordsToUpdate, pathKind);
       }});
     }}
 
@@ -1312,7 +1393,7 @@ class OpenLayersMapProvider:
       addOverlayPoint(data.path[0], 'start');
       addOverlayPoint(data.path[data.path.length - 1], 'finish');
     }}
-    updateSegmentOverlays(data.path);
+    updateSegmentOverlays(data.path, pathKind);
     addOverlayLine(data.path_done, 'pathDone');
     addOverlayLine(data.path_remaining, 'pathRemaining');
     addOverlayLine(data.debug_orbit, 'orbit');
@@ -1343,10 +1424,11 @@ class OpenLayersMapProvider:
 
     const modify = new ol.interaction.Modify({{ source: drawSource }});
     map.addInteraction(modify);
+    modify.setActive(false);
     modify.on('modifystart', () => {{
       const line = getLineFeature();
       watchLine(line);
-      updateSegmentOverlays(lineCoordsFromFeature(line));
+      updateSegmentOverlays(lineCoordsFromFeature(line), pathKind);
     }});
     modify.on('modifyend', () => {{
       const line = getLineFeature();
@@ -1582,6 +1664,7 @@ class OpenLayersMapProvider:
       stopDraw: () => enableDraw(''),
       setAppendMode: (flag) => {{
         appendMode = !!flag;
+        modify.setActive(appendMode);
       }},
       setObjectSpawnMode: (flag) => {{
         spawnMode = !!flag;
@@ -1682,7 +1765,9 @@ class StaticImageMapProvider:
             min(max(y_norm, 0.0), 1.0),
         )
 
-    def render_map(self, path: list[tuple[float, float]], token: int) -> Path:
+    def render_map(
+        self, path: list[tuple[float, float]], token: int, path_kind: str | None = None
+    ) -> Path:
         lat_min = self.bounds.lat_min
         lon_min = self.bounds.lon_min
         lat_max = self.bounds.lat_max
@@ -1711,15 +1796,89 @@ class StaticImageMapProvider:
             attributionControl=False,
         )
 
-        folium.raster_layers.ImageOverlay(
-            image=self.image_path,
+        fmap.get_root().script.add_child(
+            folium.Element(f"window.__map = {fmap.get_name()};")
+        )
+
+        image_url = None
+        fallback_url = None
+        try:
+            image_url = Path(self.image_path).resolve().as_uri()
+            log.info("Static map overlay using file URI: %s", image_url)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Static map image path resolve failed: %s", exc)
+        try:
+            image_bytes = Path(self.image_path).read_bytes()
+            encoded = base64.b64encode(image_bytes).decode("ascii")
+            fallback_url = f"data:image/png;base64,{encoded}"
+            log.info("Static map overlay data URI prepared (%d bytes)", len(image_bytes))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Static map image read failed: %s", exc)
+        if image_url is None:
+            image_url = fallback_url or self.image_path
+        fallback_src = fallback_url or image_url or self.image_path
+
+        overlay = folium.raster_layers.ImageOverlay(
+            image=image_url,
             bounds=bounds,
             opacity=1.0,
             name="Static map",
             interactive=False,
             cross_origin=False,
             zindex=1,
-        ).add_to(fmap)
+        )
+        overlay.add_to(fmap)
+        if fallback_url:
+            fmap.get_root().html.add_child(
+                folium.Element(
+                    f"<script>window.__staticOverlayFallbackUrl = {json.dumps(fallback_url)};</script>"
+                )
+            )
+        fmap.get_root().script.add_child(
+            folium.Element(
+                """
+(function() {
+  if (!window.L) { console.error('Leaflet failed to load'); return; }
+  var tries = 0;
+  var maxTries = 40;
+  function resolveMap() {
+    var map = window.__map || Object.values(window).find(function(v) { return v instanceof L.Map; });
+    if (!map) {
+      tries += 1;
+      if (tries >= maxTries) {
+        console.error('Map instance not found');
+        return;
+      }
+      setTimeout(resolveMap, 50);
+      return;
+    }
+    map.whenReady(function() {
+      var overlays = [];
+      for (var key in map._layers) {
+        if (!Object.prototype.hasOwnProperty.call(map._layers, key)) continue;
+        var layer = map._layers[key];
+        if (layer instanceof L.ImageOverlay) overlays.push(layer);
+      }
+      if (!overlays.length) {
+        console.error('Static overlay not found');
+        return;
+      }
+      overlays.forEach(function(overlay) {
+        overlay.on('load', function() { console.log('Static overlay loaded'); });
+        overlay.on('error', function() {
+          console.error('Static overlay failed');
+          if (window.__staticOverlayFallbackUrl) {
+            overlay.setUrl(window.__staticOverlayFallbackUrl);
+          }
+        });
+      });
+    });
+  }
+  resolveMap();
+})();
+"""
+            )
+        )
         fmap.fit_bounds(bounds)
 
         Draw(
@@ -1776,7 +1935,7 @@ class StaticImageMapProvider:
                 folium.Element(f"<script>window.__initialUavPose = {payload};</script>")
             )
 
-        if deps.debug_target:
+        if _spawn_debug_visuals_enabled() and deps.debug_target:
             lat = deps.debug_target.get("lat")
             lon = deps.debug_target.get("lon")
             if lat is not None and lon is not None:
@@ -1789,7 +1948,7 @@ class StaticImageMapProvider:
                     weight=2,
                 ).add_to(fmap)
 
-        if deps.debug_orbit_path and deps.debug_orbit_path != path:
+        if _spawn_debug_visuals_enabled() and deps.debug_orbit_path and deps.debug_orbit_path != path:
             folium.PolyLine(
                 locations=[(lat, lon) for lat, lon in deps.debug_orbit_path],
                 color="orange",
@@ -1804,6 +1963,9 @@ class StaticImageMapProvider:
     border-radius: {self._radius_px}px !important;
     overflow: hidden !important;
     background: transparent !important;
+    background-image: url({json.dumps(fallback_src)});
+    background-size: cover !important;
+    background-position: center !important;
 }}
 .leaflet-pane, .leaflet-map-pane {{
     border-radius: {self._radius_px}px !important;

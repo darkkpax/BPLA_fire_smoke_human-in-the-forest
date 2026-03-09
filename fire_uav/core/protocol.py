@@ -19,8 +19,16 @@ class TelemetryMessage(BaseModel):
     lat: float
     lon: float
     alt: float
+    alt_agl: float | None = None
     yaw: float
     battery: float
+    pitch: float | None = None
+    roll: float | None = None
+    status: str | None = None
+    flight_mode: str | None = None
+    camera_mount_pitch_deg: float | None = None
+    camera_mount_yaw_deg: float | None = None
+    camera_mount_roll_deg: float | None = None
 
 
 class Waypoint(BaseModel):

@@ -40,6 +40,7 @@ def main() -> None:  # noqa: D401
     # Ensure background threads stop when window closes to avoid Qt aborts.
     app.aboutToQuit.connect(lambda: deps.get_lifecycle().stop_all())  # type: ignore[arg-type]
     win = MainWindow()
+    app.aboutToQuit.connect(lambda: win.stop_services())  # type: ignore[arg-type]
 
     # регистрируем только реально существующие компоненты
     for comp in (getattr(win, "cam_thr", None), getattr(win, "det_thr", None)):

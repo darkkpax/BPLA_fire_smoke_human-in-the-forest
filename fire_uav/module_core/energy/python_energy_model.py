@@ -29,6 +29,19 @@ class PythonEnergyModel(IEnergyModel):
         self.min_return_percent = min_return_percent
         self.critical_battery_percent = critical_battery_percent
 
+    def max_range_m(self) -> float:
+        derived_range_m = 0.0
+        if self.power_cruise_w > 0 and self.cruise_speed_mps > 0 and self.battery_wh > 0:
+            derived_range_m = (
+                (self.battery_wh / self.power_cruise_w) * self.cruise_speed_mps * 3600.0
+            )
+        configured_range_m = max(0.0, float(self.max_flight_distance_m))
+        if configured_range_m > 0 and derived_range_m > 0:
+            return min(configured_range_m, derived_range_m)
+        if configured_range_m > 0:
+            return configured_range_m
+        return derived_range_m
+
     def _route_distance_m(self, route: Route) -> float:
         distance = 0.0
         for prev, cur in zip(route.waypoints, route.waypoints[1:]):
@@ -54,7 +67,8 @@ class PythonEnergyModel(IEnergyModel):
     ) -> EnergyEstimate:
         battery_percent = coerce_battery_percent(telemetry.battery, telemetry.battery_percent)
 
-        if self.max_flight_distance_m <= 0:
+        max_range_m = self.max_range_m()
+        if max_range_m <= 0:
             log.warning("EnergyModel: max_flight_distance_m invalid; allowing route without checks.")
             return EnergyEstimate(can_complete=True, required_percent=100.0, margin_percent=0.0)
 
@@ -68,7 +82,7 @@ class PythonEnergyModel(IEnergyModel):
 
         return_leg = haversine_m((end_lat, end_lon), (base_location.lat, base_location.lon))
         total_distance = route_length + return_leg
-        required_percent = (total_distance / self.max_flight_distance_m) * 100.0
+        required_percent = (total_distance / max_range_m) * 100.0
         reserved = max(0.0, self.min_return_percent)
         can_complete = battery_percent >= required_percent + reserved
         margin = battery_percent - (required_percent + reserved)

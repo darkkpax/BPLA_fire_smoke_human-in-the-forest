@@ -66,12 +66,22 @@ class DetectorVM(QObject):
         # ����?�>������? bbox'�< ��� batch.detections
         det_pairs: list[tuple[BBox, float]] = []
         for d in getattr(batch, "detections", []):
-            if hasattr(d, "bbox") and isinstance(getattr(d, "bbox"), tuple):
-                x1, y1, x2, y2 = getattr(d, "bbox")
-                bbox = (int(x1), int(y1), int(x2), int(y2))
+            bbox = None
+            raw_bbox = getattr(d, "bbox", None)
+            if isinstance(raw_bbox, (tuple, list)) and len(raw_bbox) == 4:
+                if all(v is not None for v in raw_bbox):
+                    try:
+                        bbox = (int(raw_bbox[0]), int(raw_bbox[1]), int(raw_bbox[2]), int(raw_bbox[3]))
+                    except (TypeError, ValueError):
+                        bbox = None
             elif all(hasattr(d, k) for k in ("x1", "y1", "x2", "y2")):
-                bbox = (int(d.x1), int(d.y1), int(d.x2), int(d.y2))
-            else:
+                coords = [getattr(d, k) for k in ("x1", "y1", "x2", "y2")]
+                if all(v is not None for v in coords):
+                    try:
+                        bbox = (int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3]))
+                    except (TypeError, ValueError):
+                        bbox = None
+            if bbox is None:
                 continue
             conf = float(getattr(d, "confidence", getattr(d, "score", 0.0)))
             det_pairs.append((bbox, conf))
@@ -79,7 +89,11 @@ class DetectorVM(QObject):
         stable_boxes, stable_conf = self._stable_tracks(det_pairs)
         self._last_stable_conf = stable_conf
         self._last_stable_count = len(stable_boxes)
-        self.bboxes.emit(stable_boxes)
+        # Show raw boxes immediately for operator feedback; K/N stability is used for confidence/confirmation.
+        if stable_boxes:
+            self.bboxes.emit(stable_boxes)
+        else:
+            self.bboxes.emit([bbox for bbox, _ in det_pairs])
 
     @property
     def last_stable_conf(self) -> float:
@@ -100,6 +114,13 @@ class DetectorVM(QObject):
 
         used_tracks: set[int] = set()
         for bbox, conf in detections:
+            # guard: skip invalid bboxes (None or wrong shape)
+            if bbox is None:
+                continue
+            if len(bbox) != 4:
+                continue
+            if any(v is None for v in bbox):
+                continue
             match_idx = self._match_track(bbox, used_tracks)
             if match_idx is None:
                 self._tracks.append(

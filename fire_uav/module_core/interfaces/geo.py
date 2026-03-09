@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Optional
 
 from fire_uav.module_core.schema import GeoDetection, TelemetrySample
 
@@ -19,6 +20,6 @@ class IGeoProjector(ABC):
         bbox: tuple[float, float, float, float],
         image_width: int,
         image_height: int,
-    ) -> tuple[float, float]:
-        """Project a bounding-box center from image space to ground lat/lon."""
+    ) -> Optional[tuple[float, float]]:
+        """Project a bounding-box center from image space to ground lat/lon or return None."""
 

@@ -3,11 +3,16 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import queue
 import tempfile
 import time
 import uuid
+import os
+from collections import deque
 from pathlib import Path
 from datetime import datetime
+from enum import StrEnum
 from typing import Callable, Final
 
 import cv2
@@ -30,9 +35,18 @@ from fire_uav.gui.map_providers import (
 )
 from fire_uav.gui.viewmodels.detector_vm import DetectorVM
 from fire_uav.gui.viewmodels.planner_vm import PlannerVM
-from fire_uav.module_core.factories import get_energy_model
+from fire_uav.module_core.factories import build_camera_params, get_energy_model
 from fire_uav.module_core.geometry import haversine_m
+from fire_uav.module_core.drivers.registry import resolve_driver_type
+from fire_uav.module_core.detections.pipeline import (
+    DetectionBatchPayload,
+    DetectionPipeline,
+    RawDetectionPayload,
+)
+from fire_uav.module_core.detections.aggregator import DetectionAggregator
 from fire_uav.module_core.schema import Route, TelemetrySample, Waypoint, WorldCoord
+from fire_uav.domain.video.camera import CameraParams
+from fire_uav.gui.services.unreal_link_service import UnrealLinkService
 from fire_uav.services.components.camera import CameraThread
 from fire_uav.services.bus import Event, bus
 from fire_uav.services.debug_sim import DebugSimulationService
@@ -42,9 +56,17 @@ from fire_uav.services.mission.action_policy import MissionActionPolicy
 from fire_uav.services.mission.active_path import ActivePathController, ActivePathMode
 from fire_uav.services.notifications import ToastDeduplicator
 from fire_uav.services.objects_store import ConfirmedObject, ConfirmedObjectsStore
+from fire_uav.services.targets.target_tracker import TargetObservation, TargetTracker
 from fire_uav.services.ui_throttle import TelemetryStore
 
 _log: Final = logging.getLogger(__name__)
+
+
+class OrbitFlowState(StrEnum):
+    NORMAL_FLIGHT = "normal_flight"
+    TARGET_DETECTED_REACTION_WINDOW = "target_detected_reaction_window"
+    ORBIT_ACTIVE = "orbit_active"
+    ROUTE_RESUME = "route_resume"
 
 
 # --------------------------------------------------------------------------- #
@@ -58,20 +80,25 @@ class VideoFrameProvider(QQuickImageProvider):
         self._image = QImage()
 
     def requestImage(self, _id, size, requestedSize):  # type: ignore[override]
-        if not self._image.isNull():
-            if size is not None:
-                size.setWidth(self._image.width())
-                size.setHeight(self._image.height())
-            return self._image
+        # PySide6 expects ONLY QImage as return value.
+        img = self._image
 
-        # fallback placeholder to avoid QML warnings
-        placeholder = QImage(
-            requestedSize.width() if requestedSize else 1280,
-            requestedSize.height() if requestedSize else 720,
-            QImage.Format.Format_ARGB32,
-        )
-        placeholder.fill(QColor("#0a111b"))
-        return placeholder
+        if img is None or img.isNull():
+            # placeholder
+            w = requestedSize.width() if requestedSize and requestedSize.width() > 0 else 1280
+            h = requestedSize.height() if requestedSize and requestedSize.height() > 0 else 720
+            placeholder = QImage(w, h, QImage.Format.Format_ARGB32)
+            placeholder.fill(QColor("#0a111b"))
+            if size is not None:
+                size.setWidth(placeholder.width())
+                size.setHeight(placeholder.height())
+            return placeholder
+
+        if size is not None:
+            size.setWidth(img.width())
+            size.setHeight(img.height())
+        return img
+
 
     def set_image(self, image: QImage) -> None:
         self._image = image
@@ -86,35 +113,73 @@ class VideoBridge(QObject):
         super().__init__()
         self._provider = provider
         self._last_frame: NDArray[np.uint8] | None = None
-        self._bboxes: list[tuple[int, int, int, int]] = []
+        self._last_qimage: QImage | None = None
+        self._bboxes: list[tuple[float, float, float, float]] = []
         self._counter = 0
 
     @Slot(object)
     def set_bboxes(self, boxes: list[tuple[int, int, int, int]] | None) -> None:
-        self._bboxes = boxes or []
+        parsed: list[tuple[float, float, float, float]] = []
+        for box in boxes or []:
+            if not isinstance(box, (tuple, list)) or len(box) != 4:
+                continue
+            try:
+                parsed.append((float(box[0]), float(box[1]), float(box[2]), float(box[3])))
+            except Exception:
+                continue
+        self._bboxes = parsed
         self._render()
 
     def update_frame(self, frame: NDArray[np.uint8]) -> None:
         self._last_frame = frame
+        self._last_qimage = None
+        self._render()
+
+    def update_qimage(self, image: QImage) -> None:
+        if image.isNull():
+            return
+        self._last_qimage = image.copy()
+        self._last_frame = None
         self._render()
 
     # ---------- internal ---------- #
     def _render(self) -> None:
-        if self._last_frame is None:
+        if self._last_frame is not None:
+            h, w, _ = self._last_frame.shape
+            base = QImage(self._last_frame.data, w, h, 3 * w, QImage.Format.Format_BGR888).copy()
+        elif self._last_qimage is not None:
+            base = self._last_qimage.copy()
+            w = base.width()
+            h = base.height()
+        else:
             return
 
-        h, w, _ = self._last_frame.shape
-        img = QImage(self._last_frame.data, w, h, 3 * w, QImage.Format.Format_BGR888).copy()
-
         if self._bboxes:
-            painter = QPainter(img)
+            painter = QPainter(base)
             pen = QPen(QColor("#70e0ff"), 2)
             painter.setPen(pen)
             for x1, y1, x2, y2 in self._bboxes:
-                painter.drawRect(x1, y1, x2 - x1, y2 - y1)
+                normalized = all(abs(v) <= 1.5 for v in (x1, y1, x2, y2))
+                scale_x = float(w) if normalized else 1.0
+                scale_y = float(h) if normalized else 1.0
+                px1 = x1 * scale_x
+                py1 = y1 * scale_y
+                px2 = x2 * scale_x
+                py2 = y2 * scale_y
+                # Fallback for xywh-formatted detections.
+                if px2 <= px1 or py2 <= py1:
+                    px2 = px1 + (x2 * scale_x)
+                    py2 = py1 + (y2 * scale_y)
+                cx1 = max(0, min(int(round(px1)), w - 1))
+                cy1 = max(0, min(int(round(py1)), h - 1))
+                cx2 = max(0, min(int(round(px2)), w - 1))
+                cy2 = max(0, min(int(round(py2)), h - 1))
+                if cx2 <= cx1 or cy2 <= cy1:
+                    continue
+                painter.drawRect(cx1, cy1, cx2 - cx1, cy2 - cy1)
             painter.end()
 
-        self._provider.set_image(img)
+        self._provider.set_image(base)
         self._counter += 1
         self.frameReady.emit(f"image://video/live?{self._counter}")
 
@@ -194,7 +259,7 @@ class QmlLogHandler(logging.Handler, QObject):
 
 
 class MapBridge(QObject):
-    """Generates Folium map with draw controls and bridges JS→Python via console logs."""
+    """Generates Folium map with draw controls and bridges JS to Python via console logs."""
 
     urlChanged = Signal(QUrl)
     toastRequested = Signal(str)
@@ -212,7 +277,11 @@ class MapBridge(QObject):
         self._last_render_progress: float | None = None
         self._last_telemetry_pos: tuple[float, float] | None = None
         self._last_render_ts: float | None = None
-        self.render_map()
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(33)
+        self._render_timer.timeout.connect(self._render_map_now)
+        self._render_map_now()
 
     # ----- properties exposed to QML ----- #
     @Property(QUrl, notify=urlChanged)
@@ -228,6 +297,11 @@ class MapBridge(QObject):
     # ----- slots for QML ----- #
     @Slot()
     def render_map(self) -> None:
+        if self._render_timer.isActive():
+            return
+        self._render_timer.start()
+
+    def _render_map_now(self) -> None:
         path = self._vm.get_active_path()
         self._map_path = self._provider.render_map(path, self._token)
         self._token += 1
@@ -315,7 +389,7 @@ class MapBridge(QObject):
     def save_plan(self) -> None:
         try:
             fn = self._vm.export_qgc_plan(alt_m=120.0)
-            self.toastRequested.emit(f"Mission saved → {fn.relative_to(fn.parents[1])}")
+            self.toastRequested.emit(f"Mission saved -> {fn.relative_to(fn.parents[1])}")
         except Exception as exc:  # noqa: BLE001
             self.toastRequested.emit(str(exc))
 
@@ -491,7 +565,7 @@ class MapBridge(QObject):
             return None
         return str(image_path), bounds
 
-    def _build_static_provider(self) -> StaticImageMapProvider | None:
+    def _build_static_provider(self) -> MapProvider | None:
         image_path = getattr(settings, "static_map_image_path", None)
         bounds = getattr(settings, "static_map_bounds", None)
         if not image_path or not bounds:
@@ -517,7 +591,19 @@ class MapBridge(QObject):
         if not image_path.exists():
             _log.warning("Static map image not found at %s", image_path)
             return None
-        return StaticImageMapProvider(image_path=str(image_path), bounds=bounds)
+        _log.info(
+            "Static map ready: image=%s bounds=(%.6f, %.6f)-(%.6f, %.6f)",
+            image_path,
+            bounds.lat_min,
+            bounds.lon_min,
+            bounds.lat_max,
+            bounds.lon_max,
+        )
+        return OpenLayersMapProvider(
+            provider="openlayers_de",
+            static_image_path=str(image_path),
+            static_bounds=bounds,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -532,6 +618,7 @@ class AppController(QObject):
     confidenceChanged = Signal()
     detectorRunningChanged = Signal()
     cameraAvailableChanged = Signal()
+    cameraStatusDetailChanged = Signal()
     statsChanged = Signal()
     debugModeChanged = Signal()
     simCameraEnabledChanged = Signal()
@@ -550,6 +637,10 @@ class AppController(QObject):
     homePickModeChanged = Signal()
     objectSpawnModeChanged = Signal()
     mapRefreshNeededChanged = Signal()
+    backendChanged = Signal()
+    unrealVideoModeChanged = Signal()
+    autoOrbitEnabledChanged = Signal()
+    orbitRadiusMChanged = Signal()
 
     def __init__(
         self,
@@ -569,12 +660,15 @@ class AppController(QObject):
         self._confidence = getattr(settings, "yolo_conf", 0.25)
         self._detector_running = False
         self._camera_available = camera_available
+        self._camera_status_detail = "Camera not found"
         self._fps = 0.0
         self._latency_ms = 0.0
         self._bus_alive = False
         self._detection_conf = 0.0
         self._last_frame_ts: float | None = None
         self._last_detection_ts: float | None = None
+        self._last_detection_log_ts: float | None = None
+        self._last_detection_sig: tuple[int, tuple[int, ...], tuple[int, int, int, int] | None] | None = None
         self._ground_station_enabled = bool(getattr(settings, "ground_station_enabled", False))
         self._det_json_path = Path(getattr(settings, "output_root", Path("data/outputs"))) / (
             "detections.jsonl"
@@ -595,6 +689,7 @@ class AppController(QObject):
         self._mission_state = self._mission.current_state
         deps.mission_state = self._mission_state.value
         self._allow_unsafe_start = False
+        self._pending_unreal_autostart = False
         self._mission.set_allow_unsafe_start(self._allow_unsafe_start)
         self._commands_enabled = True
         self._capabilities = {
@@ -605,7 +700,10 @@ class AppController(QObject):
             "supports_camera": True,
         }
         self._route_edit_mode = False
+        self._hold_sent_for_edit = False
         self._staged_plan: list[tuple[float, float]] | None = None
+        self._route_edit_anchor: tuple[float, float] | None = None
+        self._route_edit_original_plan: list[tuple[float, float]] | None = None
         self._latest_telemetry: TelemetrySample | None = None
         self._uav_states: dict[str, UavState] = {}
         self._telemetry_store = TelemetryStore()
@@ -620,6 +718,32 @@ class AppController(QObject):
         self._toast_dedupe = ToastDeduplicator()
         self._flight_recorder = FlightRecorder()
         self._objects_store = ConfirmedObjectsStore(on_change=self._on_objects_changed)
+        self._target_tracker = TargetTracker(
+            match_radius_m=float(getattr(settings, "match_radius_m", 30.0) or 30.0),
+            suppression_radius_m=float(getattr(settings, "suppression_radius_m", 60.0) or 60.0),
+            suppression_ttl_s=float(getattr(settings, "suppression_ttl_s", 180.0) or 180.0),
+            stable_frames_n=int(getattr(settings, "stable_frames_n", 1) or 1),
+        )
+        self._known_confirmed_ids: set[str] = set()
+        self._auto_orbit_enabled = bool(getattr(settings, "auto_orbit_enabled", False))
+        self._orbit_radius_m = float(getattr(settings, "orbit_radius_m", 50.0) or 50.0)
+        self._orbit_flow_state = OrbitFlowState.NORMAL_FLIGHT
+        self._reaction_target_id: str | None = None
+        self._reaction_started_monotonic = 0.0
+        self._reaction_window_s = float(getattr(settings, "target_reaction_window_s", 4.0) or 4.0)
+        self._reaction_slow_speed_mps = float(getattr(settings, "reaction_slow_speed_mps", 1.0) or 1.0)
+        self._reaction_speed_override_active = False
+        self._camera_info_ready = True
+        self._pending_orbit_queue: list[tuple[str, str]] = []
+        self._pending_orbit_ids: set[str] = set()
+        self._last_orbit_availability: tuple[bool, bool] | None = None
+        self._orbit_active = False
+        self._orbit_rejoin_wp: Waypoint | None = None
+        self._orbit_rejoin_close_hits = 0
+        self._orbit_rejoin_threshold_m = float(getattr(settings, "orbit_rejoin_threshold_m", 15.0) or 15.0)
+        self._orbit_target_track_ids: set[int] = set()
+        self._orbit_target_centers: list[tuple[float, float]] = []
+        self._route_complete_announced = False
         self._debug_sim: DebugSimulationService | None = None
         self._rtl_forced = False
         self._rtl_route_sent = False
@@ -633,6 +757,40 @@ class AppController(QObject):
         self._bridge_speed_mps = float(
             self._bridge_profiles.get(self._bridge_profile_id, {}).get("speed_mps", 8.0)
         )
+        self._backend = resolve_driver_type(settings)
+        self._camera_info_ready = self._backend != "unreal"
+        self._unreal_link: UnrealLinkService | None = None
+        self._unreal_uav_id = str(getattr(settings, "uav_id", None) or "sim")
+        self._unreal_detection_source = str(
+            getattr(settings, "unreal_detection_source", "local_yolo") or "local_yolo"
+        ).lower()
+        if self._unreal_detection_source not in ("backend", "local_yolo", "both"):
+            self._unreal_detection_source = "local_yolo"
+        self._unreal_local_yolo_enabled = (
+            self._backend == "unreal" and self._unreal_detection_source in ("local_yolo", "both")
+        )
+        self._unreal_local_detect_hz = max(
+            0.1,
+            float(getattr(settings, "unreal_local_detect_hz", 5.0) or 5.0),
+        )
+        self._unreal_local_detect_interval_s = 1.0 / self._unreal_local_detect_hz
+        self._unreal_local_last_push_ts = 0.0
+        self._unreal_local_feed_window_ts = 0.0
+        self._unreal_local_feed_pushed = 0
+        self._unreal_local_feed_dropped = 0
+        self._unreal_local_feed_skipped = 0
+        self._unreal_local_feed_log_window_s = 5.0
+        self._unreal_local_pipeline: DetectionPipeline | None = None
+        self._projector_camera_params = build_camera_params(settings)
+        self._unreal_local_detector_autostart_done = False
+        self._unreal_local_first_confirmed_logged = False
+        self._unreal_local_telemetry_by_frame_id: dict[str, TelemetrySample] = {}
+        self._unreal_local_frame_order: deque[str] = deque()
+        self._unreal_status = "disconnected"
+        self._unreal_video_mode = str(
+            getattr(settings, "unreal_video_mode", "h264_stream") or "h264_stream"
+        ).lower()
+        self._video_visible = False
         self._route_battery_text = "Route: --"
         self._route_battery_remaining_text = "Remaining: --"
         self._route_battery_warning = False
@@ -668,6 +826,36 @@ class AppController(QObject):
         bus.subscribe(Event.CAPABILITIES_UPDATED, self._on_capabilities_updated)
         bus.subscribe(Event.WARNING_TOAST, self._on_warning_toast)
         bus.subscribe(Event.FLIGHT_SESSION_ENDED, self._on_flight_session_ended)
+        if self._unreal_local_yolo_enabled:
+            votes_required = max(
+                1,
+                int(getattr(settings, "unreal_local_votes_required", 1) or 1),
+            )
+            window = max(
+                1,
+                int(getattr(settings, "unreal_local_agg_window", 3) or 3),
+            )
+            aggregator = DetectionAggregator(
+                window=window,
+                votes_required=votes_required,
+                min_confidence=float(getattr(settings, "agg_min_confidence", 0.4) or 0.4),
+                max_distance_m=float(getattr(settings, "agg_max_distance_m", 25.0) or 25.0),
+                ttl_seconds=float(getattr(settings, "agg_ttl_seconds", 3.0) or 3.0),
+            )
+            self._unreal_local_pipeline = DetectionPipeline(
+                aggregator=aggregator,
+                camera_params=self._projector_camera_params,
+                target_tracker=self._target_tracker,
+            )
+            bus.subscribe(Event.DETECTION, self._on_local_detection_batch)
+            _log.info(
+                "Unreal local YOLO pipeline enabled (source=%s, feed_hz=%.1f, votes=%d, window=%d)",
+                self._unreal_detection_source,
+                self._unreal_local_detect_hz,
+                votes_required,
+                window,
+            )
+        setattr(deps, "route_edit_anchor", None)
         self._load_persisted_home_location()
         self._update_route_estimate(self._active_path.get_active_path())
         self.map_bridge.render_map()
@@ -688,6 +876,10 @@ class AppController(QObject):
     @Property(bool, notify=cameraAvailableChanged)
     def cameraAvailable(self) -> bool:
         return self._camera_available
+
+    @Property(str, notify=cameraStatusDetailChanged)
+    def cameraStatusDetail(self) -> str:
+        return self._camera_status_detail
 
     @Property(str, notify=missionStateChanged)
     def missionState(self) -> str:
@@ -734,6 +926,14 @@ class AppController(QObject):
         return self._current_action_policy().can_apply_route_edits
 
     @Property(bool, notify=flightControlsChanged)
+    def canCancelRouteEdits(self) -> bool:
+        return self._route_edit_mode
+
+    @Property(bool, notify=flightControlsChanged)
+    def canOpenOrbit(self) -> bool:
+        return self._current_action_policy().can_open_orbit
+
+    @Property(bool, notify=flightControlsChanged)
     def canOrbit(self) -> bool:
         return self._current_action_policy().can_orbit
 
@@ -761,13 +961,21 @@ class AppController(QObject):
     def routeEditMode(self) -> bool:
         return self._route_edit_mode
 
+    @Property(bool, notify=autoOrbitEnabledChanged)
+    def autoOrbitEnabled(self) -> bool:
+        return self._auto_orbit_enabled
+
+    @Property(float, notify=orbitRadiusMChanged)
+    def orbitRadiusM(self) -> float:
+        return self._orbit_radius_m
+
     @Property(int, notify=flightControlsChanged)
     def confirmedObjectCount(self) -> int:
         return self._objects_store.count()
 
     @Property(bool, notify=flightControlsChanged)
     def orbitAvailable(self) -> bool:
-        return self._current_action_policy().can_orbit
+        return self._current_action_policy().can_open_orbit
 
     @Property("QVariantList", notify=confirmedObjectsChanged)
     def confirmedObjects(self) -> list[dict[str, object]]:
@@ -830,6 +1038,14 @@ class AppController(QObject):
     @Property(bool, notify=mapRefreshNeededChanged)
     def mapRefreshNeeded(self) -> bool:
         return self._map_refresh_needed
+
+    @Property(str, notify=backendChanged)
+    def currentBackend(self) -> str:
+        return self._backend
+
+    @Property(str, notify=unrealVideoModeChanged)
+    def unrealVideoMode(self) -> str:
+        return self._unreal_video_mode
 
     @Property(float, notify=statsChanged)
     def fps(self) -> float:
@@ -920,11 +1136,512 @@ class AppController(QObject):
         self._detector_running = False
         self.detectorRunningChanged.emit()
 
+    def attach_unreal_link(self, link: UnrealLinkService) -> None:
+        self._unreal_link = link
+        self._unreal_link.set_camera_enabled(self._video_visible)
+
+    def on_unreal_camera_info(self, payload: dict[str, object]) -> None:
+        self._camera_info_ready = True
+        self._projector_camera_params = CameraParams(
+            fov_deg=float(payload.get("fov_deg", self._projector_camera_params.fov_deg)),
+            mount_pitch_deg=float(
+                payload.get("mount_pitch_deg", self._projector_camera_params.mount_pitch_deg)
+            ),
+            mount_yaw_deg=float(payload.get("mount_yaw_deg", self._projector_camera_params.mount_yaw_deg)),
+            mount_roll_deg=float(
+                payload.get("mount_roll_deg", self._projector_camera_params.mount_roll_deg)
+            ),
+        )
+        if self._unreal_local_pipeline is None:
+            return
+        projector = getattr(self._unreal_local_pipeline, "projector", None)
+        if projector is None or not hasattr(projector, "set_camera_params"):
+            return
+        try:
+            projector.set_camera_params(self._projector_camera_params)  # type: ignore[attr-defined]
+            _log.info(
+                "Applied Unreal camera_info to projector: fov=%.2f mount(ypr)=(%.2f, %.2f, %.2f)",
+                self._projector_camera_params.fov_deg,
+                self._projector_camera_params.mount_yaw_deg,
+                self._projector_camera_params.mount_pitch_deg,
+                self._projector_camera_params.mount_roll_deg,
+            )
+            _log.debug(
+                "Camera orientation source=unreal_camera_info (mount_pitch_deg=%.2f); local projection now uses runtime camera info",
+                self._projector_camera_params.mount_pitch_deg,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("Failed to apply camera_info to local projector: %s", exc)
+
+    def on_camera_image(self, image: QImage) -> None:
+        self._camera_monitor.on_frame()
+        self._last_frame_ts = time.perf_counter()
+        if not self._camera_available:
+            self.set_camera_available(True)
+        if (
+            self._unreal_local_yolo_enabled
+            and not self._detector_running
+            and not self._unreal_local_detector_autostart_done
+        ):
+            self.startDetector()
+            self._unreal_local_detector_autostart_done = True
+            _log.info("Auto-started local YOLO detector on first Unreal camera frame")
+        self._set_camera_status_detail("Live")
+        self.video_bridge.update_qimage(image)
+        self._feed_unreal_local_detector(image)
+        self._update_stats()
+
+    def _feed_unreal_local_detector(self, image: QImage) -> None:
+        if not self._unreal_local_yolo_enabled:
+            return
+        if not self._detector_running:
+            return
+        if deps.frame_queue is None:
+            return
+        now = time.perf_counter()
+        if (now - self._unreal_local_last_push_ts) < self._unreal_local_detect_interval_s:
+            self._unreal_local_feed_skipped += 1
+            self._maybe_log_unreal_local_feed(now)
+            return
+        try:
+            frame_bgr = self._qimage_to_bgr_frame(image)
+            captured_at = datetime.utcnow()
+            frame_id = f"unreal_local:{captured_at.isoformat(timespec='microseconds')}"
+            if self._latest_telemetry is not None:
+                self._remember_unreal_local_telemetry(
+                    frame_id,
+                    self._latest_telemetry.model_copy(deep=True),
+                )
+            deps.frame_queue.put_nowait(
+                {
+                    "frame": frame_bgr,
+                    "camera_id": "unreal_local",
+                    "timestamp": captured_at,
+                }
+            )
+            self._unreal_local_last_push_ts = now
+            self._unreal_local_feed_pushed += 1
+        except queue.Full:
+            self._unreal_local_feed_dropped += 1
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("Failed to convert/feed Unreal frame to local detector: %s", exc)
+        self._maybe_log_unreal_local_feed(now)
+
+    def _maybe_log_unreal_local_feed(self, now: float | None = None) -> None:
+        if not self._unreal_local_yolo_enabled:
+            return
+        ts = time.perf_counter() if now is None else now
+        if self._unreal_local_feed_window_ts <= 0.0:
+            self._unreal_local_feed_window_ts = ts
+            return
+        elapsed = ts - self._unreal_local_feed_window_ts
+        if elapsed < self._unreal_local_feed_log_window_s:
+            return
+        hz = self._unreal_local_feed_pushed / max(elapsed, 1e-3)
+        _log.info(
+            "Unreal local YOLO feed: pushed=%d dropped_queue_full=%d skipped_rate_limit=%d hz=%.2f target_hz=%.2f",
+            self._unreal_local_feed_pushed,
+            self._unreal_local_feed_dropped,
+            self._unreal_local_feed_skipped,
+            hz,
+            self._unreal_local_detect_hz,
+        )
+        self._unreal_local_feed_window_ts = ts
+        self._unreal_local_feed_pushed = 0
+        self._unreal_local_feed_dropped = 0
+        self._unreal_local_feed_skipped = 0
+
+    @staticmethod
+    def _qimage_to_bgr_frame(image: QImage) -> NDArray[np.uint8]:
+        rgb = image.convertToFormat(QImage.Format.Format_RGB888)
+        if rgb.isNull():
+            raise ValueError("QImage is null")
+        width = rgb.width()
+        height = rgb.height()
+        bytes_per_line = rgb.bytesPerLine()
+        bits = rgb.bits()
+        raw = bytes(bits)
+        needed = bytes_per_line * height
+        if len(raw) < needed:
+            raise ValueError("QImage buffer shorter than expected")
+        arr = np.frombuffer(raw[:needed], dtype=np.uint8).reshape((height, bytes_per_line))
+        rgb_arr = arr[:, : width * 3].reshape((height, width, 3))
+        return cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
+
+    def _on_local_detection_batch(self, batch: object) -> None:
+        if not self._unreal_local_yolo_enabled:
+            return
+        if self._unreal_local_pipeline is None:
+            return
+        if self._backend == "unreal" and not self._camera_info_ready:
+            _log.debug(
+                "Skipping local detection geo-confirmation: camera_info not ready (projection source of truth unavailable)"
+            )
+            return
+        frame_meta = getattr(batch, "frame", None)
+        if frame_meta is None:
+            return
+        try:
+            frame_width = int(getattr(frame_meta, "width"))
+            frame_height = int(getattr(frame_meta, "height"))
+        except Exception:  # noqa: BLE001
+            return
+        if frame_width <= 0 or frame_height <= 0:
+            return
+        captured_at = self._coerce_datetime(getattr(frame_meta, "timestamp", None)) or datetime.utcnow()
+        camera_id = str(getattr(frame_meta, "camera_id", None) or "unreal_local")
+        # Important for K/N aggregation: frame_id must be unique per frame, not constant camera_id.
+        frame_id = f"{camera_id}:{captured_at.isoformat(timespec='microseconds')}"
+        telemetry = self._pop_unreal_local_telemetry(frame_id)
+        if telemetry is None:
+            telemetry = self._latest_telemetry
+        if telemetry is None:
+            return
+        raw_detections: list[RawDetectionPayload] = []
+        for det in getattr(batch, "detections", []) or []:
+            bbox = self._extract_bbox_tuple(det)
+            if bbox is None:
+                continue
+            det_ts = self._coerce_datetime(getattr(det, "timestamp", None)) or captured_at
+            try:
+                raw_detections.append(
+                    RawDetectionPayload(
+                        class_id=int(getattr(det, "class_id", getattr(det, "cls", 0)) or 0),
+                        confidence=float(getattr(det, "confidence", getattr(det, "score", 0.0)) or 0.0),
+                        bbox=bbox,
+                        frame_id=frame_id,
+                        timestamp=det_ts,
+                        track_id=getattr(det, "track_id", None),
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                continue
+        if not raw_detections:
+            return
+        try:
+            payload = DetectionBatchPayload(
+                frame_id=frame_id,
+                frame_width=frame_width,
+                frame_height=frame_height,
+                captured_at=captured_at,
+                telemetry=telemetry,
+                detections=raw_detections,
+            )
+            confirmed = self._unreal_local_pipeline.process_batch(payload)
+            confirmed_count = len(confirmed or [])
+            _log.info(
+                "Unreal local YOLO batch frame_id=%s raw=%d confirmed=%d became_confirmed=%s",
+                frame_id,
+                len(raw_detections),
+                confirmed_count,
+                "yes" if confirmed_count > 0 else "no",
+            )
+            if confirmed_count > 0:
+                _log.info(
+                    "Unreal local YOLO confirmed classes=%s frame_id=%s",
+                    [det.class_id for det in confirmed],
+                    frame_id,
+                )
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("Unreal local YOLO pipeline processing failed: %s", exc)
+
+    def process_backend_detections(self, objects: list[dict[str, object]]) -> None:
+        if not objects:
+            return
+        emitted = 0
+        for obj in objects:
+            lat = obj.get("lat")
+            lon = obj.get("lon")
+            try:
+                lat_f = float(lat)
+                lon_f = float(lon)
+            except (TypeError, ValueError):
+                continue
+            class_id = self._extract_class_id(obj)
+            ts = self._coerce_datetime(obj.get("timestamp")) or datetime.utcnow()
+            updates = self._target_tracker.update(
+                [
+                    TargetObservation(
+                        class_label=str(class_id),
+                        lat=lat_f,
+                        lon=lon_f,
+                        timestamp=ts,
+                        confidence=float(obj.get("confidence", 0.0) or 0.0),
+                    )
+                ]
+            )
+            if not updates or not updates[0].should_confirm:
+                continue
+            track = updates[0].track
+            payload = {
+                "object_id": f"track-{track.track_id}",
+                "source_id": obj.get("source_id"),
+                "class_id": class_id,
+                "confidence": float(obj.get("confidence", 0.0) or 0.0),
+                "lat": float(track.lat),
+                "lon": float(track.lon),
+                "track_id": int(track.track_id),
+                "timestamp": ts,
+            }
+            bus.emit(Event.OBJECT_CONFIRMED_UI, payload)
+            emitted += 1
+        if emitted > 0:
+            _log.info("Backend detections emitted stable targets=%d", emitted)
+
+    @staticmethod
+    def _extract_class_id(payload: dict[str, object]) -> int:
+        raw = payload.get("class_id")
+        if raw is None:
+            raw = payload.get("cls")
+        if raw is None:
+            raw = payload.get("class")
+        try:
+            return int(raw)
+        except Exception:
+            text = str(raw or "").strip().lower()
+            if text == "fire":
+                return 1
+            if text in ("human", "person"):
+                return 2
+            return 0
+
+    @staticmethod
+    def _extract_bbox_tuple(det: object) -> tuple[int, int, int, int] | None:
+        bbox = getattr(det, "bbox", None)
+        if isinstance(bbox, (tuple, list)) and len(bbox) == 4:
+            try:
+                return (
+                    int(bbox[0]),
+                    int(bbox[1]),
+                    int(bbox[2]),
+                    int(bbox[3]),
+                )
+            except Exception:  # noqa: BLE001
+                return None
+        if all(hasattr(det, k) for k in ("x1", "y1", "x2", "y2")):
+            try:
+                return (
+                    int(getattr(det, "x1")),
+                    int(getattr(det, "y1")),
+                    int(getattr(det, "x2")),
+                    int(getattr(det, "y2")),
+                )
+            except Exception:  # noqa: BLE001
+                return None
+        return None
+
+    @staticmethod
+    def _coerce_datetime(value: object) -> datetime | None:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                if text.endswith("Z"):
+                    text = f"{text[:-1]}+00:00"
+                dt = datetime.fromisoformat(text)
+                if dt.tzinfo is not None:
+                    return dt.replace(tzinfo=None)
+                return dt
+            except ValueError:
+                return None
+        return None
+
+    def _remember_unreal_local_telemetry(self, frame_id: str, sample: TelemetrySample) -> None:
+        self._unreal_local_telemetry_by_frame_id[frame_id] = sample
+        self._unreal_local_frame_order.append(frame_id)
+        while len(self._unreal_local_frame_order) > 64:
+            stale_id = self._unreal_local_frame_order.popleft()
+            self._unreal_local_telemetry_by_frame_id.pop(stale_id, None)
+
+    def _pop_unreal_local_telemetry(self, frame_id: str) -> TelemetrySample | None:
+        sample = self._unreal_local_telemetry_by_frame_id.pop(frame_id, None)
+        if sample is None:
+            return None
+        try:
+            self._unreal_local_frame_order.remove(frame_id)
+        except ValueError:
+            pass
+        return sample
+
+    def on_unreal_link_status(self, status: str) -> None:
+        if status == self._unreal_status:
+            return
+        self._unreal_status = status
+        if status == "waiting_for_route":
+            self._emit_warning(
+                key="unreal_waiting_route",
+                message="Unreal waiting for route; draw + confirm plan",
+                severity="warn",
+                cooldown_s=6,
+            )
+        elif status == "disconnected":
+            self._emit_warning(
+                key="unreal_disconnected",
+                message="Unreal link disconnected",
+                severity="warn",
+                cooldown_s=8,
+            )
+            if self._backend == "unreal" and self._mission_state != MissionState.PREFLIGHT:
+                self._mission.abort_to_preflight("unreal_disconnected")
+                self._pending_unreal_autostart = False
+                self._active_path.set_normal()
+                self._clear_confirmed_objects()
+                self.map_bridge.render_map()
+                self.planConfirmedChanged.emit()
+                self.flightControlsChanged.emit()
+        elif status == "connected":
+            self._emit_warning(
+                key="unreal_connected",
+                message="Unreal link connected",
+                severity="info",
+                cooldown_s=4,
+            )
+
+    def on_unreal_camera_status(self, status: str) -> None:
+        mode_label = "H264" if self._unreal_video_mode == "h264_stream" else "JPEG"
+        if status == "pyav_missing_jpeg_fallback":
+            self._set_camera_status_detail("PyAV missing; using JPEG fallback (requested H264)")
+            self.set_camera_available(False)
+        elif status == "waiting_for_route":
+            self._set_camera_status_detail(f"Waiting for route / drone not spawned ({mode_label})")
+            self.set_camera_available(False)
+        elif status == "disconnected":
+            self._set_camera_status_detail(f"Camera stream disconnected ({mode_label})")
+            self.set_camera_available(False)
+        elif status == "paused":
+            self._set_camera_status_detail(f"Camera paused ({mode_label})")
+        elif status == "streaming":
+            self._set_camera_status_detail(f"Live ({mode_label})")
+        else:
+            self._set_camera_status_detail(f"Camera not found ({mode_label})")
+
+    def set_unreal_static_map(self, image_path: str, bounds: MapBounds) -> None:
+        setattr(settings, "static_map_image_path", image_path)
+        setattr(settings, "static_map_bounds", bounds.model_dump())
+        setattr(settings, "map_provider", "static_image")
+        _log.info(
+            "Unreal static map set: image=%s bounds=(%.6f, %.6f)-(%.6f, %.6f)",
+            image_path,
+            bounds.lat_min,
+            bounds.lon_min,
+            bounds.lat_max,
+            bounds.lon_max,
+        )
+        self.map_bridge.set_provider("static_image", offline=True, cache_dir="")
+        self._set_map_refresh_needed(True)
+        self.toastRequested.emit("Unreal map loaded")
+
+    @Slot(str)
+    def setBackend(self, backend: str) -> None:
+        normalized = str(backend or "").strip().lower()
+        aliases = {
+            "unreal": "unreal",
+            "mavlink": "mavlink",
+            "stub": "stub",
+            "custom": "custom",
+            "client_bridge": "custom",
+            "custom_sdk": "custom",
+        }
+        if normalized in aliases:
+            normalized = aliases[normalized]
+        if normalized not in ("unreal", "mavlink", "stub", "custom"):
+            _log.warning("Backend switch rejected: unknown backend '%s'", backend)
+            self.toastRequested.emit(f"Unknown backend: {backend}")
+            return
+        if normalized == self._backend:
+            self.toastRequested.emit(f"Backend already set: {normalized}")
+            return
+        try:
+            cfg_path = self._resolve_settings_path()
+            raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+            raw["uav_backend"] = normalized
+            raw["driver_type"] = normalized
+            cfg_path.write_text(json.dumps(raw, indent=2, ensure_ascii=True), encoding="utf-8")
+            setattr(settings, "uav_backend", normalized)
+            setattr(settings, "driver_type", normalized)
+            self._backend = normalized
+            self.backendChanged.emit()
+            _log.info("Backend switched to %s (settings: %s)", normalized, cfg_path)
+            self.toastRequested.emit(f"Backend set to {normalized}. Restart module to apply.")
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("Failed to switch backend to %s: %s", normalized, exc)
+            self.toastRequested.emit(f"Failed to switch backend: {exc}")
+
+    def _resolve_settings_path(self) -> Path:
+        env_path = os.environ.get("FIRE_UAV_SETTINGS")
+        if env_path:
+            return Path(env_path).expanduser()
+        import fire_uav
+
+        pkg_root = Path(fire_uav.__file__).resolve().parent
+        return pkg_root / "config" / "settings_default.json"
+
     @Slot(float)
     def setConfidence(self, value: float) -> None:
         self._confidence = float(value)
         self.det_vm.set_conf(self._confidence)
         self.confidenceChanged.emit()
+
+    @Slot(bool)
+    def setAutoOrbitEnabled(self, enabled: bool) -> None:
+        flag = bool(enabled)
+        if flag == self._auto_orbit_enabled:
+            return
+        self._auto_orbit_enabled = flag
+        setattr(settings, "auto_orbit_enabled", flag)
+        self.autoOrbitEnabledChanged.emit()
+
+    @Slot(float)
+    def setOrbitRadiusM(self, value: float) -> None:
+        try:
+            radius = float(value)
+        except (TypeError, ValueError):
+            return
+        radius = max(1.0, radius)
+        if abs(radius - self._orbit_radius_m) < 1e-6:
+            return
+        self._orbit_radius_m = radius
+        setattr(settings, "orbit_radius_m", radius)
+        self.orbitRadiusMChanged.emit()
+
+    @Slot(bool)
+    def setVideoVisible(self, visible: bool) -> None:
+        self._video_visible = bool(visible)
+        if self._unreal_link is not None:
+            self._unreal_link.set_camera_enabled(self._video_visible)
+
+    @Slot(str)
+    def setUnrealVideoMode(self, mode: str) -> None:
+        normalized = str(mode or "").strip().lower()
+        if normalized not in ("jpeg_snapshots", "h264_stream"):
+            self.toastRequested.emit(f"Unknown video mode: {mode}")
+            return
+        if normalized == self._unreal_video_mode:
+            return
+        try:
+            cfg_path = self._resolve_settings_path()
+            raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+            raw["unreal_video_mode"] = normalized
+            cfg_path.write_text(json.dumps(raw, indent=2, ensure_ascii=True), encoding="utf-8")
+            setattr(settings, "unreal_video_mode", normalized)
+            self._unreal_video_mode = normalized
+            self.unrealVideoModeChanged.emit()
+            _log.info(
+                "Unreal video mode updated in UI: %s (link_attached=%s)",
+                normalized,
+                self._unreal_link is not None,
+            )
+            if self._unreal_link is not None:
+                self._unreal_link.set_camera_mode(normalized)
+            else:
+                self.toastRequested.emit("Unreal link not attached (mode saved only)")
+            self.toastRequested.emit(f"Unreal video mode: {normalized}")
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("Failed to update Unreal video mode: %s", exc)
+            self.toastRequested.emit(f"Failed to update video mode: {exc}")
 
     @Slot(str)
     def handleMapConsole(self, message: str) -> None:
@@ -961,7 +1678,7 @@ class AppController(QObject):
         self._set_home_location(lat, lon)
         self.stopHomePickMode()
         self._set_map_refresh_needed(True)
-        self.toastRequested.emit(f"Home set: {lat:.6f}, {lon:.6f} — click Update map")
+        self.toastRequested.emit(f"Home set: {lat:.6f}, {lon:.6f} - click Update map")
 
     @Slot()
     def clearHomeLocation(self) -> None:
@@ -975,7 +1692,7 @@ class AppController(QObject):
         self._clear_persisted_home_location()
         self._set_map_refresh_needed(True)
         _log.info("Home location cleared")
-        self.toastRequested.emit("Home cleared — click Update map")
+        self.toastRequested.emit("Home cleared - click Update map")
 
     @Slot()
     def startManualTargetMode(self) -> None:
@@ -1008,14 +1725,12 @@ class AppController(QObject):
             "lat": lat_val,
             "lon": lon_val,
             "track_id": None,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.utcnow(),
         }
         bus.emit(Event.OBJECT_CONFIRMED_UI, payload)
         self._objects_store.set_selected(object_id)
         deps.selected_object_id = object_id
         self.stopManualTargetMode()
-        self._set_map_refresh_needed(True)
-        self.toastRequested.emit("Manual target created — click Update map")
 
     @Slot()
     def generatePath(self) -> None:
@@ -1043,7 +1758,7 @@ class AppController(QObject):
         if not path:
             self.toastRequested.emit("Draw/generate a route first")
             return
-        if not self._telemetry_available():
+        if not self._telemetry_available() and self._backend != "unreal":
             self.toastRequested.emit("Telemetry unavailable; enable Sim telemetry or connect UAV")
             return
         if not self._mission.confirm_plan(path):
@@ -1061,16 +1776,26 @@ class AppController(QObject):
                     severity="warn",
                     cooldown_s=8,
                 )
-        self.startFlight()
+        if self._backend == "unreal" and self._unreal_link is not None:
+            route = self._route_from_points(path)
+            if route is None:
+                self.toastRequested.emit("Route invalid; cannot send")
+                return
+            if not self._send_unreal_route(route):
+                self.toastRequested.emit("Failed to send route to Unreal")
+                return
+            self._schedule_unreal_autostart()
+        else:
+            self.startFlight()
         if self._mission.current_state != MissionState.IN_FLIGHT:
             self.toastRequested.emit("Plan confirmed")
 
     @Slot()
-    def startFlight(self) -> None:
+    def startFlight(self, *, skip_checks: bool = False) -> None:
         if not self._mission.plan_confirmed:
             self.toastRequested.emit("Confirm the plan first")
             return
-        if not self._link_monitor.is_link_ok():
+        if not skip_checks and not self._link_monitor.is_link_ok():
             self._emit_warning(
                 key="uav_link_missing",
                 message="UAV link missing; cannot start flight",
@@ -1079,7 +1804,7 @@ class AppController(QObject):
             )
             if not self._allow_unsafe_start:
                 return
-        if not self._camera_monitor.is_camera_ok():
+        if not skip_checks and not self._camera_monitor.is_camera_ok():
             self._emit_warning(
                 key="camera_missing",
                 message="Camera not ready; cannot start flight",
@@ -1088,7 +1813,7 @@ class AppController(QObject):
             )
             if not self._allow_unsafe_start:
                 return
-        if self._latest_telemetry and not self._route_energy_ok(self._mission.confirmed_plan or []):
+        if not skip_checks and self._latest_telemetry and not self._route_energy_ok(self._mission.confirmed_plan or []):
             self._emit_warning(
                 key="battery_route_insufficient",
                 message="Insufficient battery for planned route",
@@ -1096,8 +1821,9 @@ class AppController(QObject):
                 cooldown_s=8,
             )
             return
-        if self._mission.start_flight(skip_checks=False):
+        if self._mission.start_flight(skip_checks=skip_checks):
             self._commands_enabled = True
+            self._route_complete_announced = False
             self._rtl_forced = False
             self._rtl_route_sent = False
             deps.rtl_path = None
@@ -1111,8 +1837,24 @@ class AppController(QObject):
     def editRoute(self) -> None:
         if self._mission_state != MissionState.IN_FLIGHT:
             return
-        self._route_edit_mode = True
+        if self._latest_telemetry is None:
+            self.toastRequested.emit("Telemetry unavailable; cannot enter route edit")
+            return
+        if self._backend == "unreal" and self._unreal_link is not None:
+            if not self._try_unreal_hold_for_route_edit():
+                self.toastRequested.emit("Failed to send HOLD to Unreal")
+                return
+        current_plan = self._mission.confirmed_plan or self._plan_vm.get_path() or []
+        self._route_edit_original_plan = [(float(lat), float(lon)) for lat, lon in current_plan]
         self._staged_plan = None
+        self._route_edit_mode = True
+        anchor = (float(self._latest_telemetry.lat), float(self._latest_telemetry.lon))
+        self._route_edit_anchor = anchor
+        deps.plan_data = {"path": [anchor, anchor]}
+        deps.debug_orbit_path = None
+        deps.rtl_path = None
+        setattr(deps, "route_edit_anchor", {"lat": anchor[0], "lon": anchor[1]})
+        self.map_bridge.render_map()
         self.toastRequested.emit("Edit mode: draw a new path on the map, double-click to finish, then Apply")
         self.flightControlsChanged.emit()
 
@@ -1121,22 +1863,89 @@ class AppController(QObject):
         if not self._route_edit_mode:
             return
         if not self._staged_plan:
-            self.toastRequested.emit("No staged route to apply")
+            self.toastRequested.emit("Draw at least 1 point before apply")
             return
-        self._mission.confirm_plan(self._staged_plan)
+        pts = list(self._staged_plan)
+        if self._route_edit_anchor is not None:
+            if not pts or haversine_m(self._route_edit_anchor, pts[0]) > 1.0:
+                pts = [self._route_edit_anchor] + pts
+        deduped: list[tuple[float, float]] = []
+        for pt in pts:
+            if not deduped:
+                deduped.append(pt)
+                continue
+            if haversine_m(deduped[-1], pt) <= 1.0:
+                continue
+            deduped.append(pt)
+        pts = deduped
+        route = self._route_from_points(pts)
+        if route is None:
+            self.toastRequested.emit("Route needs at least 2 points")
+            return
+        resume_failed = False
+        if self._backend == "unreal" and self._unreal_link is not None:
+            if not self._send_unreal_route(route):
+                self.toastRequested.emit("Failed to send updated route to Unreal")
+                return
+            if not self._try_unreal_resume_after_route_edit():
+                resume_failed = True
+        self._plan_vm.save_plan(pts)
+        self._mission.confirm_plan(pts)
         deps.rtl_path = None
         deps.debug_orbit_path = None
+        self._route_edit_anchor = None
+        self._route_edit_original_plan = None
+        setattr(deps, "route_edit_anchor", None)
         self._active_path.set_normal()
         self._update_route_estimate(self._active_path.get_active_path())
         self._route_edit_mode = False
+        self._hold_sent_for_edit = False
         self._staged_plan = None
         self.planConfirmedChanged.emit()
         self.flightControlsChanged.emit()
-        self.toastRequested.emit("Route updates applied")
+        self.map_bridge.render_map()
+        if resume_failed:
+            self.toastRequested.emit("Route sent; resume manually in Unreal")
+        else:
+            self.toastRequested.emit("Route updates applied")
+
+    @Slot()
+    def cancelRouteEdits(self) -> None:
+        if not self._route_edit_mode:
+            return
+        if self._route_edit_original_plan is not None:
+            self._plan_vm.save_plan(list(self._route_edit_original_plan))
+        resume_failed = False
+        if self._backend == "unreal" and self._unreal_link is not None:
+            if not self._try_unreal_resume_after_route_edit():
+                resume_failed = True
+        self._route_edit_mode = False
+        self._hold_sent_for_edit = False
+        self._staged_plan = None
+        self._route_edit_anchor = None
+        self._route_edit_original_plan = None
+        setattr(deps, "route_edit_anchor", None)
+        self._active_path.set_normal()
+        deps.rtl_path = None
+        deps.debug_orbit_path = None
+        self.map_bridge.render_map()
+        self.planConfirmedChanged.emit()
+        self.flightControlsChanged.emit()
+        if resume_failed:
+            self.toastRequested.emit("Edit cancelled; resumed original route (resume manually in Unreal)")
+        else:
+            self.toastRequested.emit("Edit cancelled; resumed original route")
 
     @Slot()
     def returnToHome(self) -> None:
         if self._mission_state != MissionState.IN_FLIGHT:
+            return
+        if self._backend == "unreal" and self._unreal_link is not None:
+            if self._unreal_link.send_command("RTL"):
+                self._mission.trigger_rtl("operator_rtl")
+                self.toastRequested.emit("Return-to-home initiated")
+            else:
+                self.toastRequested.emit("Failed to send RTL to Unreal")
             return
         if not self._current_action_policy().can_rtl:
             if not self._link_monitor.is_link_ok():
@@ -1154,6 +1963,12 @@ class AppController(QObject):
 
     @Slot()
     def sendRtlRoute(self) -> None:
+        if self._backend == "unreal" and self._unreal_link is not None:
+            if self._unreal_link.send_command("RTL"):
+                self.toastRequested.emit("RTL command sent to Unreal")
+            else:
+                self.toastRequested.emit("Failed to send RTL to Unreal")
+            return
         if not self._current_action_policy().can_send_rtl_route:
             if not self._link_monitor.is_link_ok():
                 self._emit_warning(
@@ -1169,6 +1984,22 @@ class AppController(QObject):
     def completeLanding(self) -> None:
         if not self._current_action_policy().can_complete_landing:
             return
+        if self._mission_state == MissionState.POSTFLIGHT:
+            if self._backend == "unreal":
+                self._send_unreal_despawn()
+            self._mission.set_preflight("operator_postflight_confirm")
+            self._mission.invalidate_plan("operator_postflight_confirm")
+            self._pending_unreal_autostart = False
+            self._rtl_route_sent = False
+            deps.rtl_path = None
+            deps.debug_orbit_path = None
+            self._active_path.set_normal()
+            self._clear_confirmed_objects()
+            self.map_bridge.render_map()
+            self.planConfirmedChanged.emit()
+            self.flightControlsChanged.emit()
+            self.toastRequested.emit("Mission completed and reset to idle")
+            return
         self._mission.land_complete("operator_land")
         self._rtl_route_sent = False
         self.toastRequested.emit("Landing confirmed")
@@ -1177,11 +2008,15 @@ class AppController(QObject):
     def abortToPreflight(self) -> None:
         if not self._current_action_policy().can_abort_to_preflight:
             return
+        if self._backend == "unreal":
+            self._send_unreal_despawn()
         self._mission.abort_to_preflight("operator_abort")
+        self._pending_unreal_autostart = False
         deps.rtl_path = None
         deps.debug_orbit_path = None
         self._rtl_route_sent = False
         self._active_path.set_normal()
+        self._clear_confirmed_objects()
         self.map_bridge.render_map()
         self.planConfirmedChanged.emit()
         self.flightControlsChanged.emit()
@@ -1189,10 +2024,14 @@ class AppController(QObject):
 
     @Slot()
     def backToPlanning(self) -> None:
+        if self._backend == "unreal":
+            self._send_unreal_despawn()
         self._mission.set_preflight("postflight_reset")
         self._mission.invalidate_plan("postflight_reset")
+        self._pending_unreal_autostart = False
         deps.rtl_path = None
         deps.debug_orbit_path = None
+        self._clear_confirmed_objects()
         self.planConfirmedChanged.emit()
         self.flightControlsChanged.emit()
         self.toastRequested.emit("Back to planning")
@@ -1210,7 +2049,7 @@ class AppController(QObject):
             target = self._objects_store.latest()
         if target is None:
             return
-        self._orbit_targets([target])
+        self._orbit_targets([target], source="manual")
 
     @Slot("QVariantList")
     def orbitSelectedObjects(self, object_ids: list) -> None:
@@ -1223,7 +2062,15 @@ class AppController(QObject):
         if not targets:
             self.toastRequested.emit("Selected objects unavailable")
             return
-        self._orbit_targets(targets)
+        self._orbit_targets(targets, source="manual")
+
+    @Slot()
+    def orbitAllConfirmedObjects(self) -> None:
+        targets = self._objects_store.all()
+        if not targets:
+            self.toastRequested.emit("No confirmed objects available")
+            return
+        self._orbit_targets(targets, source="manual")
 
     @Slot(bool)
     def setSimTelemetryEnabled(
@@ -1272,27 +2119,31 @@ class AppController(QObject):
 
     @Slot(bool)
     def setBridgeModeEnabled(self, enabled: bool) -> None:
-        desired = bool(enabled)
-        if self._bridge_mode_enabled == desired:
+        if self._bridge_mode_enabled == enabled:
             return
-        self._bridge_mode_enabled = desired
-        self.bridgeModeChanged.emit()
-        _log.info("BRIDGE_MODE -> %s", "ON" if desired else "OFF")
-
+        self._bridge_mode_enabled = bool(enabled)
         if self._debug_sim is not None:
-            self._debug_sim.set_bridge_mode(desired)
-            if desired:
-                self.setSimTelemetryEnabled(
-                    True,
-                    notify_route_missing=False,
-                    allow_without_route=True,
-                )
-                _log.info("SIM_TELEMETRY ON (bridge)")
-                self.setSimCameraEnabled(True)
-                _log.info("SIM_CAMERA ON (bridge)")
-
+            self._debug_sim.set_bridge_mode(enabled)
+        self.bridgeModeChanged.emit()
         self.flightControlsChanged.emit()
-        self._update_route_estimate()
+        if not enabled:
+            _log.info("BRIDGE_MODE -> OFF (streams unchanged)")
+            return
+        _log.info("BRIDGE_MODE -> ON")
+        if self._debug_sim is None:
+            return
+        telemetry_ok = self.setSimTelemetryEnabled(
+            True,
+            notify_route_missing=False,
+            allow_without_route=False,
+        )
+        if not telemetry_ok:
+            self.toastRequested.emit("bridge mode needs a route: draw/generate + confirm route first")
+            _log.info("SIM_TELEMETRY blocked (bridge; route missing)")
+        else:
+            _log.info("SIM_TELEMETRY ON (bridge)")
+        self.setSimCameraEnabled(True)
+        _log.info("SIM_CAMERA ON (bridge)")
 
     @Slot(str)
     def setBridgeBatteryProfile(self, profile_id: str) -> None:
@@ -1313,6 +2164,7 @@ class AppController(QObject):
     def setAllowUnsafeStart(self, enabled: bool) -> None:
         self._allow_unsafe_start = bool(enabled)
         self._mission.set_allow_unsafe_start(self._allow_unsafe_start)
+        self._attempt_unreal_autostart()
         self.unsafeStartChanged.emit()
         self.flightControlsChanged.emit()
     @Slot()
@@ -1405,7 +2257,9 @@ class AppController(QObject):
         state.update_from_sample(sample)
         self._link_monitor.on_telemetry(sample)
         self._flight_recorder.record_telemetry(sample)
+        self._handle_mission_progress_from_telemetry(sample)
         self._handle_battery(sample)
+        self._maybe_restore_route_after_orbit(sample)
         self._update_route_estimate()
         self.statsChanged.emit()
 
@@ -1433,7 +2287,7 @@ class AppController(QObject):
         stable_conf = getattr(self.det_vm, "last_stable_conf", 0.0)
         eff_conf = stable_conf if stable_count > 0 else best_conf
         self._detection_conf = eff_conf
-        _log.info(
+        _log.debug(
             "GUI detection event: raw=%d best=%.2f stable=%d stable_conf=%.2f bbox=%s",
             len(det_list),
             best_conf,
@@ -1462,12 +2316,110 @@ class AppController(QObject):
         if not isinstance(payload, dict):
             return
         obj_id = str(payload.get("object_id", ""))
+        lat = payload.get("lat")
+        lon = payload.get("lon")
+        try:
+            _log.info(
+                "OBJECT_CONFIRMED_UI emitted id=%s lat=%.6f lon=%.6f store_count=%d",
+                obj_id or "n/a",
+                float(lat),
+                float(lon),
+                self._objects_store.count(),
+            )
+        except Exception:
+            _log.info(
+                "OBJECT_CONFIRMED_UI emitted id=%s lat=%s lon=%s store_count=%d",
+                obj_id or "n/a",
+                lat,
+                lon,
+                self._objects_store.count(),
+            )
         cls_id = int(payload.get("class_id", -1))
         conf = float(payload.get("confidence", 0.0))
         track_id = payload.get("track_id")
         track_str = f", track {track_id}" if track_id is not None else ""
         msg = f"Object {obj_id} (class {cls_id}{track_str}, conf {conf:.2f}) detected"
         self.objectNotificationReceived.emit(obj_id, cls_id, conf, msg, track_id)
+
+    def _auto_orbit_after_confirm(self, object_id: str) -> None:
+        target = self._objects_store.get(object_id) if object_id else self._objects_store.latest()
+        if target is None:
+            return
+        self._orbit_targets([target], source="auto")
+
+    def _set_orbit_flow_state(self, state: OrbitFlowState, *, reason: str) -> None:
+        if self._orbit_flow_state == state:
+            return
+        _log.info(
+            "orbit_flow_state: %s -> %s (reason=%s)",
+            self._orbit_flow_state.value,
+            state.value,
+            reason,
+        )
+        self._orbit_flow_state = state
+
+    def _apply_reaction_slowdown(self) -> None:
+        if self._reaction_speed_override_active:
+            return
+        if self._backend != "unreal" or self._unreal_link is None:
+            return
+        if not self._commands_enabled:
+            return
+        if self._unreal_link.send_command("SET_SPEED", {"speed_mps": float(self._reaction_slow_speed_mps)}):
+            self._reaction_speed_override_active = True
+
+    def _clear_reaction_slowdown(self) -> None:
+        if not self._reaction_speed_override_active:
+            return
+        if self._backend == "unreal" and self._unreal_link is not None:
+            self._unreal_link.send_command("CLEAR_VELOCITY_OVERRIDE")
+        self._reaction_speed_override_active = False
+
+    def _start_reaction_window(self, target: ConfirmedObject) -> None:
+        self._reaction_target_id = target.object_id
+        self._reaction_started_monotonic = time.monotonic()
+        self._set_orbit_flow_state(
+            OrbitFlowState.TARGET_DETECTED_REACTION_WINDOW,
+            reason=f"target_confirmed:{target.object_id}",
+        )
+        self._apply_reaction_slowdown()
+
+    def _finish_reaction_window(self, *, reason: str) -> None:
+        self._reaction_target_id = None
+        self._reaction_started_monotonic = 0.0
+        self._clear_reaction_slowdown()
+        self._set_orbit_flow_state(OrbitFlowState.ROUTE_RESUME, reason=reason)
+        self._set_orbit_flow_state(OrbitFlowState.NORMAL_FLIGHT, reason=f"{reason}:resume_done")
+
+    def _tick_reaction_window(self) -> None:
+        if self._orbit_flow_state != OrbitFlowState.TARGET_DETECTED_REACTION_WINDOW:
+            return
+        if self._reaction_started_monotonic <= 0.0:
+            return
+        elapsed = time.monotonic() - self._reaction_started_monotonic
+        if elapsed < self._reaction_window_s:
+            return
+        target = self._objects_store.get(self._reaction_target_id or "")
+        if self._auto_orbit_enabled and target is not None:
+            self._orbit_targets([target], source="auto_timeout")
+            return
+        self._finish_reaction_window(reason="reaction_timeout_continue")
+
+    def _queue_pending_orbit_target(self, target: ConfirmedObject, *, source: str) -> None:
+        if target.object_id in self._pending_orbit_ids:
+            return
+        self._pending_orbit_ids.add(target.object_id)
+        self._pending_orbit_queue.append((target.object_id, source))
+
+    def _dequeue_pending_orbit_targets(self) -> list[tuple[ConfirmedObject, str]]:
+        queued: list[tuple[ConfirmedObject, str]] = []
+        while self._pending_orbit_queue:
+            object_id, source = self._pending_orbit_queue.pop(0)
+            self._pending_orbit_ids.discard(object_id)
+            target = self._objects_store.get(object_id)
+            if target is not None:
+                queued.append((target, source))
+        return queued
 
     def attach_debug_sim(self, sim: DebugSimulationService) -> None:
         self._debug_sim = sim
@@ -1491,7 +2443,35 @@ class AppController(QObject):
         self._link_monitor.check()
         self._camera_monitor.check()
         self._mission.refresh_readiness("status_tick")
+        self._tick_reaction_window()
         self.flightControlsChanged.emit()
+
+    def _schedule_unreal_autostart(self) -> None:
+        if self._backend != "unreal":
+            return
+        self._pending_unreal_autostart = True
+        self._attempt_unreal_autostart()
+
+    def _attempt_unreal_autostart(self) -> None:
+        if not self._pending_unreal_autostart:
+            return
+        if self._mission_state == MissionState.IN_FLIGHT:
+            self._pending_unreal_autostart = False
+            return
+        if self._mission_state not in (MissionState.PREFLIGHT, MissionState.READY):
+            self._pending_unreal_autostart = False
+            return
+        if not self._mission.plan_confirmed:
+            self._pending_unreal_autostart = False
+            return
+        link_ok = self._link_monitor.is_link_ok()
+        telemetry_seen = self._latest_telemetry is not None
+        if not (link_ok or telemetry_seen):
+            if not self._allow_unsafe_start:
+                return
+        self.startFlight(skip_checks=True)
+        if self._mission_state == MissionState.IN_FLIGHT:
+            self._pending_unreal_autostart = False
 
     def _on_mission_state(self, payload: object) -> None:
         if not isinstance(payload, dict):
@@ -1509,8 +2489,20 @@ class AppController(QObject):
         if prev_state == MissionState.READY and new_state == MissionState.IN_FLIGHT:
             _log.info("missionState transition: %s -> %s", prev_state.value, new_state.value)
         if new_state in (MissionState.PREFLIGHT, MissionState.READY):
+            self._route_complete_announced = False
+            self._clear_manual_orbit_state()
+            self._clear_reaction_slowdown()
+            self._reaction_target_id = None
+            self._reaction_started_monotonic = 0.0
+            self._pending_orbit_queue = []
+            self._pending_orbit_ids = set()
+            self._set_orbit_flow_state(OrbitFlowState.NORMAL_FLIGHT, reason="mission_state_reset")
             self._route_edit_mode = False
+            self._hold_sent_for_edit = False
             self._staged_plan = None
+            self._route_edit_anchor = None
+            self._route_edit_original_plan = None
+            setattr(deps, "route_edit_anchor", None)
             self._commands_enabled = True
             self._rtl_forced = False
             self._rtl_route_sent = False
@@ -1522,12 +2514,25 @@ class AppController(QObject):
                 self._flight_summary = None
                 self.flightSummaryChanged.emit()
         if new_state == MissionState.IN_FLIGHT:
+            self._pending_unreal_autostart = False
             self._commands_enabled = self._link_monitor.is_link_ok()
         if new_state == MissionState.RTL:
             self._commands_enabled = self._link_monitor.is_link_ok()
         if new_state == MissionState.POSTFLIGHT:
+            self._route_complete_announced = True
+            self._clear_manual_orbit_state()
+            self._clear_reaction_slowdown()
+            self._reaction_target_id = None
+            self._reaction_started_monotonic = 0.0
+            self._pending_orbit_queue = []
+            self._pending_orbit_ids = set()
+            self._set_orbit_flow_state(OrbitFlowState.NORMAL_FLIGHT, reason="mission_postflight")
             self._route_edit_mode = False
+            self._hold_sent_for_edit = False
             self._staged_plan = None
+            self._route_edit_anchor = None
+            self._route_edit_original_plan = None
+            setattr(deps, "route_edit_anchor", None)
             deps.rtl_path = None
             deps.debug_orbit_path = None
         if new_state in (MissionState.PREFLIGHT, MissionState.READY, MissionState.POSTFLIGHT):
@@ -1564,6 +2569,7 @@ class AppController(QObject):
                 cooldown_s=6,
             )
         self._mission.refresh_readiness("link_status")
+        self._attempt_unreal_autostart()
         self.linkStatusChanged.emit()
         self.flightControlsChanged.emit()
 
@@ -1620,12 +2626,20 @@ class AppController(QObject):
         path = [(float(lat), float(lon)) for lat, lon in pts]
         if self._mission_state == MissionState.IN_FLIGHT:
             if not self._route_edit_mode:
-                self._route_edit_mode = True
-                self.toastRequested.emit("Route edit mode enabled")
+                self.toastRequested.emit("Press Edit route first")
+                restore = self._mission.confirmed_plan or self._route_edit_original_plan or []
+                if restore:
+                    self._plan_vm.save_plan([(float(lat), float(lon)) for lat, lon in restore])
+                else:
+                    deps.plan_data = {"path": []}
+                self.map_bridge.render_map()
+                self.flightControlsChanged.emit()
+                return
             self._staged_plan = path
             self.flightControlsChanged.emit()
             return
         self._mission.invalidate_plan("plan_changed")
+        self._pending_unreal_autostart = False
         deps.rtl_path = None
         self.planConfirmedChanged.emit()
         self.flightControlsChanged.emit()
@@ -1639,6 +2653,45 @@ class AppController(QObject):
         self.flightControlsChanged.emit()
 
     def _on_objects_changed(self) -> None:
+        all_objects = self._objects_store.all()
+        current_ids = {obj.object_id for obj in all_objects}
+        new_ids = current_ids - self._known_confirmed_ids
+        self._known_confirmed_ids = current_ids
+        if (
+            self._unreal_local_yolo_enabled
+            and not self._unreal_local_first_confirmed_logged
+            and self._objects_store.count() > 0
+        ):
+            self._unreal_local_first_confirmed_logged = True
+            _log.info("Unreal local YOLO first confirmed target received")
+        if new_ids:
+            was_needed = self._map_refresh_needed
+            self._set_map_refresh_needed(True)
+            if not was_needed or self._toast_dedupe.should_show("map_refresh_needed_object", 4.0):
+                self.toastRequested.emit("UAV detected object - click Update map to show on map")
+            new_targets = [obj for obj in all_objects if obj.object_id in new_ids]
+            if self._orbit_active or self._orbit_flow_state == OrbitFlowState.ORBIT_ACTIVE:
+                for target in new_targets:
+                    self._queue_pending_orbit_target(target, source="auto")
+                _log.debug(
+                    "Orbit active guard: queued new targets during orbit (count=%d)",
+                    len(new_targets),
+                )
+            elif (
+                self._mission_state == MissionState.IN_FLIGHT
+                and self._commands_enabled
+                and not self._route_edit_mode
+                and new_targets
+            ):
+                ts_targets = [obj for obj in new_targets if obj.timestamp is not None]
+                target = (
+                    max(ts_targets, key=lambda obj: obj.timestamp or datetime.min)
+                    if ts_targets
+                    else new_targets[-1]
+                )
+                self._start_reaction_window(target)
+                if self._auto_orbit_enabled:
+                    self._orbit_targets([target], source="auto")
         deps.confirmed_objects = [
             {
                 "object_id": obj.object_id,
@@ -1648,7 +2701,7 @@ class AppController(QObject):
                 "lon": obj.lon,
                 "track_id": obj.track_id,
             }
-            for obj in self._objects_store.all()
+            for obj in all_objects
         ]
         self.confirmedObjectsChanged.emit()
         self.flightControlsChanged.emit()
@@ -1717,7 +2770,7 @@ class AppController(QObject):
         supports_waypoints = bool(self._capabilities.get("supports_waypoints", True))
         supports_orbit = bool(self._capabilities.get("supports_orbit", True))
         supports_rtl = bool(self._capabilities.get("supports_rtl", True))
-        return MissionActionPolicy.evaluate(
+        policy = MissionActionPolicy.evaluate(
             mission_state=self._mission_state,
             link_ok=self._link_monitor.is_link_ok(),
             camera_ok=self._camera_monitor.is_camera_ok(),
@@ -1733,6 +2786,64 @@ class AppController(QObject):
             supports_rtl=supports_rtl,
             telemetry_available=telemetry_available,
             at_home=at_home,
+        )
+        self._log_orbit_availability_change(
+            policy=policy,
+            telemetry_available=telemetry_available,
+            selected_object_id=selected_id,
+            supports_orbit=supports_orbit,
+        )
+        return policy
+
+    def _log_orbit_availability_change(
+        self,
+        *,
+        policy: MissionActionPolicy,
+        telemetry_available: bool,
+        selected_object_id: str | None,
+        supports_orbit: bool,
+    ) -> None:
+        state = (policy.can_open_orbit, policy.can_orbit)
+        if self._last_orbit_availability == state:
+            return
+        self._last_orbit_availability = state
+
+        open_blockers: list[str] = []
+        orbit_blockers: list[str] = []
+        confirmed_count = self._objects_store.count()
+        in_flight = self._mission_state == MissionState.IN_FLIGHT
+        if not in_flight:
+            open_blockers.append("mission_not_in_flight")
+            orbit_blockers.append("mission_not_in_flight")
+        if not self._commands_enabled:
+            open_blockers.append("commands_disabled")
+            orbit_blockers.append("commands_disabled")
+        if not telemetry_available:
+            open_blockers.append("telemetry_unavailable")
+            orbit_blockers.append("telemetry_unavailable")
+        if confirmed_count <= 0:
+            open_blockers.append("no_confirmed_targets")
+            orbit_blockers.append("no_confirmed_targets")
+        if not supports_orbit:
+            open_blockers.append("orbit_not_supported")
+            orbit_blockers.append("orbit_not_supported")
+        if confirmed_count > 1 and selected_object_id is None:
+            orbit_blockers.append("selection_required_for_multiple_targets")
+
+        _log.info(
+            "Orbit availability changed: can_open_orbit=%s can_orbit=%s open_blockers=%s orbit_blockers=%s "
+            "context={mission_state=%s,commands_enabled=%s,telemetry_available=%s,confirmed_object_count=%d,"
+            "selected_object=%s,supports_orbit=%s}",
+            policy.can_open_orbit,
+            policy.can_orbit,
+            open_blockers or ["ready"],
+            orbit_blockers or ["ready"],
+            self._mission_state.value,
+            self._commands_enabled,
+            telemetry_available,
+            confirmed_count,
+            selected_object_id or "none",
+            supports_orbit,
         )
 
     def _resolve_landing_target(self) -> WorldCoord | None:
@@ -1775,11 +2886,79 @@ class AppController(QObject):
         return dist <= 30.0
 
     def _telemetry_available(self) -> bool:
+        if self._backend == "unreal":
+            return True
         if self._link_monitor.is_link_ok():
             return True
         if self._debug_sim is not None and self._debug_sim.telemetry_enabled():
             return True
         return False
+
+    def _send_unreal_route(
+        self,
+        route: Route,
+        *,
+        orbit_target: tuple[float, float] | None = None,
+        orbit_target_alt: float | None = None,
+    ) -> bool:
+        if self._unreal_link is None:
+            return False
+        wps = [{"lat": wp.lat, "lon": wp.lon, "alt": wp.alt} for wp in route.waypoints]
+        payload = {
+            "type": "route",
+            "uav_id": self._unreal_uav_id,
+            "version": route.version,
+            "waypoints": wps,
+            "active_index": route.active_index if route.active_index is not None else 0,
+        }
+        if orbit_target is not None:
+            payload["orbit_target"] = {
+                "lat": float(orbit_target[0]),
+                "lon": float(orbit_target[1]),
+            }
+            if orbit_target_alt is not None and math.isfinite(float(orbit_target_alt)):
+                payload["orbit_target"]["alt"] = float(orbit_target_alt)
+        return self._unreal_link.send_route(payload)
+
+    def _recover_from_failed_orbit_attempt(self, *, reason: str, user_message: str) -> None:
+        _log.warning("Orbit attempt failed: %s", reason)
+        if self._orbit_active:
+            return
+        self._reaction_target_id = None
+        self._reaction_started_monotonic = 0.0
+        self._clear_reaction_slowdown()
+        self._pending_orbit_queue = []
+        self._pending_orbit_ids.clear()
+        self._set_orbit_flow_state(OrbitFlowState.NORMAL_FLIGHT, reason=f"orbit_failed:{reason}")
+        self.toastRequested.emit(user_message)
+
+    def _resolve_orbit_target_altitude_m(self) -> float | None:
+        if self._latest_telemetry is None:
+            return None
+        alt_agl = getattr(self._latest_telemetry, "alt_agl", None)
+        if alt_agl is None:
+            return None
+        try:
+            return max(0.0, float(self._latest_telemetry.alt) - float(alt_agl))
+        except (TypeError, ValueError):
+            return None
+
+    def _try_unreal_hold_for_route_edit(self) -> bool:
+        if self._backend != "unreal" or self._unreal_link is None:
+            return True
+        if self._hold_sent_for_edit:
+            return True
+        ok = self._unreal_link.send_command("HOLD")
+        if ok:
+            self._hold_sent_for_edit = True
+        return ok
+
+    def _try_unreal_resume_after_route_edit(self) -> bool:
+        if self._backend != "unreal" or self._unreal_link is None:
+            return True
+        if self._unreal_link.send_command("RESUME"):
+            return True
+        return self._unreal_link.send_command("CONTINUE")
 
     def _emit_warning(self, *, key: str, message: str, severity: str, cooldown_s: float) -> None:
         bus.emit(
@@ -1791,6 +2970,12 @@ class AppController(QObject):
                 "cooldown_s": cooldown_s,
             },
         )
+
+    def _set_camera_status_detail(self, message: str) -> None:
+        if message == self._camera_status_detail:
+            return
+        self._camera_status_detail = message
+        self.cameraStatusDetailChanged.emit()
 
     def _update_route_estimate(self, path: list[tuple[float, float]] | None = None) -> None:
         if path is None:
@@ -1883,7 +3068,7 @@ class AppController(QObject):
         self._route_battery_text = f"Route: {route_percent:.1f}%" if route_percent > 0 else "Route: --"
         self.routeBatteryChanged.emit()
 
-    def _orbit_targets(self, targets: list[ConfirmedObject]) -> None:
+    def _orbit_targets(self, targets: list[ConfirmedObject], *, source: str = "manual") -> None:
         if self._mission_state != MissionState.IN_FLIGHT:
             return
         if not self._commands_enabled:
@@ -1892,36 +3077,221 @@ class AppController(QObject):
         if not self._latest_telemetry:
             self.toastRequested.emit("No telemetry available for orbit")
             return
+        if not targets:
+            self.toastRequested.emit("No confirmed objects available")
+            return
+        if self._orbit_active:
+            for target in targets:
+                self._queue_pending_orbit_target(target, source=source)
+            _log.info("Orbit start skipped: orbit already active; queued=%d", len(targets))
+            return
+
+        valid_targets: list[ConfirmedObject] = []
+        for target in targets:
+            try:
+                lat = float(target.lat)
+                lon = float(target.lon)
+            except (TypeError, ValueError):
+                continue
+            if not (math.isfinite(lat) and math.isfinite(lon)):
+                continue
+            valid_targets.append(target)
+        if not valid_targets:
+            self._recover_from_failed_orbit_attempt(
+                reason=f"invalid_target:{source}",
+                user_message="No valid orbit targets",
+            )
+            return
+        for target in valid_targets[1:]:
+            self._queue_pending_orbit_target(target, source=source)
+        valid_targets = valid_targets[:1]
+
         base_path = self._mission.confirmed_plan or self._plan_vm.get_path()
         base_route = self._route_from_points(base_path)
         if base_route is None:
-            self.toastRequested.emit("Confirm a route before orbiting")
-            return
-        combined: list[Waypoint] = []
-        for target in targets:
-            route = self._plan_vm._route_planner.plan_maneuver(
-                current_state=self._latest_telemetry,
-                target_lat=target.lat,
-                target_lon=target.lon,
-                base_route=base_route,
+            self._recover_from_failed_orbit_attempt(
+                reason=f"missing_base_route:{source}",
+                user_message="Confirm a route before orbiting",
             )
-            if route is None:
-                self._emit_warning(
-                    key="battery_orbit_insufficient",
-                    message="Insufficient battery for orbit",
-                    severity="warn",
-                    cooldown_s=8,
+            return
+        if self._latest_telemetry is not None and base_route.waypoints:
+            base_route.active_index = self._nearest_waypoint_index(
+                float(self._latest_telemetry.lat),
+                float(self._latest_telemetry.lon),
+                base_route.waypoints,
+            )
+
+        state = self._latest_telemetry
+        rejoin_wp: Waypoint | None = None
+        target = valid_targets[0]
+        route = self._plan_vm._route_planner.plan_maneuver(
+            current_state=state,
+            target_lat=float(target.lat),
+            target_lon=float(target.lon),
+            base_route=base_route,
+        )
+        if route is None:
+            self._emit_warning(
+                key="battery_orbit_insufficient",
+                message="Insufficient battery for orbit",
+                severity="warn",
+                cooldown_s=8,
+            )
+            self._recover_from_failed_orbit_attempt(
+                reason=f"planner_rejected:{source}",
+                user_message="Orbit unavailable: energy/path check failed",
+            )
+            return
+        if not route.waypoints:
+            self._recover_from_failed_orbit_attempt(
+                reason=f"empty_route:{source}",
+                user_message="Orbit route unavailable",
+            )
+            return
+        last_wp = route.waypoints[-1]
+        if base_route.waypoints:
+            rejoin_idx = self._nearest_waypoint_index(last_wp.lat, last_wp.lon, base_route.waypoints)
+            rejoin_wp = base_route.waypoints[rejoin_idx].model_copy(deep=True)
+
+        orbit_route = Route(version=1, waypoints=route.waypoints, active_index=0)
+        orbit_target = (float(target.lat), float(target.lon))
+        if self._backend == "unreal" and self._unreal_link is not None:
+            self._try_unreal_resume_before_route_send()
+            if not self._send_unreal_route(
+                orbit_route,
+                orbit_target=orbit_target,
+                orbit_target_alt=self._resolve_orbit_target_altitude_m(),
+            ):
+                self._recover_from_failed_orbit_attempt(
+                    reason=f"route_send_failed:{source}",
+                    user_message="Failed to send orbit to Unreal",
                 )
                 return
-            combined.extend(route.waypoints)
-        if not combined:
-            self.toastRequested.emit("Orbit route unavailable")
-            return
-        deps.debug_target = {"lat": targets[-1].lat, "lon": targets[-1].lon}
-        deps.debug_orbit_path = [(wp.lat, wp.lon) for wp in combined]
+
+        self._reaction_target_id = None
+        self._reaction_started_monotonic = 0.0
+        self._clear_reaction_slowdown()
+        self._orbit_active = True
+        self._orbit_rejoin_wp = rejoin_wp
+        self._orbit_rejoin_close_hits = 0
+        self._set_pending_orbit_targets(valid_targets)
+        self._activate_orbit_target_lock()
+        self._set_orbit_flow_state(OrbitFlowState.ORBIT_ACTIVE, reason=f"orbit_started:{source}")
+
+        deps.debug_target = {"lat": orbit_target[0], "lon": orbit_target[1]}
+        deps.debug_orbit_path = [(wp.lat, wp.lon) for wp in route.waypoints]
         self._active_path.set_orbit(deps.debug_orbit_path)
         self.map_bridge.render_map()
         self.toastRequested.emit("Orbit route staged")
+
+    def _nearest_waypoint_index(self, lat: float, lon: float, route: list[Waypoint]) -> int:
+        nearest_idx = 0
+        nearest_dist = float("inf")
+        for idx, wp in enumerate(route):
+            dist = haversine_m((lat, lon), (wp.lat, wp.lon))
+            if dist < nearest_dist:
+                nearest_dist = dist
+                nearest_idx = idx
+        return nearest_idx
+
+    def _maybe_restore_route_after_orbit(self, sample: TelemetrySample) -> None:
+        if not self._orbit_active:
+            return
+        if self._orbit_rejoin_wp is None:
+            return
+
+        dist_m = haversine_m(
+            (float(sample.lat), float(sample.lon)),
+            (self._orbit_rejoin_wp.lat, self._orbit_rejoin_wp.lon),
+        )
+        if dist_m > self._orbit_rejoin_threshold_m:
+            self._orbit_rejoin_close_hits = 0
+            return
+
+        self._orbit_rejoin_close_hits += 1
+        if self._orbit_rejoin_close_hits < 2:
+            return
+
+        self._mark_pending_orbit_targets_orbited()
+        if self._backend == "unreal" and self._unreal_link is not None:
+            self._unreal_link.send_command("ORBIT_STOP")
+        self._clear_manual_orbit_state()
+        deps.debug_orbit_path = None
+        self._active_path.set_normal()
+        self._set_orbit_flow_state(OrbitFlowState.ROUTE_RESUME, reason="orbit_rejoin_reached")
+        self._set_orbit_flow_state(OrbitFlowState.NORMAL_FLIGHT, reason="route_resume_complete")
+        self.map_bridge.render_map()
+        self.toastRequested.emit("Orbit complete; resumed mission route")
+
+        queued = self._dequeue_pending_orbit_targets()
+        if queued:
+            next_target, next_source = queued[0]
+            if next_source != "auto" or self._auto_orbit_enabled:
+                self._orbit_targets([next_target], source=f"queued_{next_source}")
+
+    def _try_unreal_resume_before_route_send(self) -> None:
+        if self._backend != "unreal" or self._unreal_link is None:
+            return
+        if self._unreal_link.send_command("RESUME"):
+            return
+        self._unreal_link.send_command("CONTINUE")
+
+    def _clear_manual_orbit_state(self) -> None:
+        self._orbit_active = False
+        self._orbit_rejoin_wp = None
+        self._orbit_rejoin_close_hits = 0
+        self._orbit_target_track_ids = set()
+        self._orbit_target_centers = []
+
+    def _set_pending_orbit_targets(self, targets: list[ConfirmedObject]) -> None:
+        self._orbit_target_track_ids = set()
+        self._orbit_target_centers = []
+        for target in targets:
+            tid = self._coerce_track_id(target.track_id)
+            if tid is not None:
+                self._orbit_target_track_ids.add(tid)
+            self._orbit_target_centers.append((float(target.lat), float(target.lon)))
+
+    def _activate_orbit_target_lock(self) -> None:
+        for track_id in self._orbit_target_track_ids:
+            self._target_tracker.mark_in_orbit(track_id)
+        for lat, lon in self._orbit_target_centers:
+            self._target_tracker.add_suppression_zone(lat=lat, lon=lon)
+
+    def _mark_pending_orbit_targets_orbited(self) -> None:
+        for track_id in self._orbit_target_track_ids:
+            self._target_tracker.mark_orbited(track_id)
+        for lat, lon in self._orbit_target_centers:
+            self._target_tracker.add_suppression_zone(lat=lat, lon=lon)
+
+    def _mark_targets_orbited(self, targets: list[ConfirmedObject]) -> None:
+        for target in targets:
+            tid = self._coerce_track_id(target.track_id)
+            if tid is not None:
+                self._target_tracker.mark_orbited(tid)
+            self._target_tracker.add_suppression_zone(lat=float(target.lat), lon=float(target.lon))
+
+    @staticmethod
+    def _coerce_track_id(value: object) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _clear_confirmed_objects(self) -> None:
+        self._objects_store.clear()
+        self._target_tracker.reset()
+        self._known_confirmed_ids.clear()
+        self._pending_orbit_queue = []
+        self._pending_orbit_ids.clear()
+        self._orbit_target_track_ids.clear()
+        self._orbit_target_centers = []
+        self._reaction_target_id = None
+        self._unreal_local_telemetry_by_frame_id.clear()
+        self._unreal_local_frame_order.clear()
+        deps.selected_object_id = None
 
     def _handle_battery(self, sample: TelemetrySample) -> None:
         if self._mission_state not in (MissionState.IN_FLIGHT, MissionState.READY):
@@ -1946,6 +3316,23 @@ class AppController(QObject):
             self._send_rtl_route()
             self._mission.trigger_rtl("battery_critical")
 
+    def _handle_mission_progress_from_telemetry(self, sample: TelemetrySample) -> None:
+        mode = str(getattr(sample, "flight_mode", None) or getattr(sample, "status", None) or "").upper()
+        if not mode:
+            return
+        if mode == "WAITING_FOR_ROUTE":
+            if self._mission_state != MissionState.PREFLIGHT:
+                self._mission.abort_to_preflight("sim_waiting_for_route")
+            return
+        if mode not in ("MISSION_COMPLETE", "ROUTE_COMPLETE", "COMPLETED"):
+            return
+        if self._route_complete_announced:
+            return
+        self._route_complete_announced = True
+        if self._mission_state in (MissionState.IN_FLIGHT, MissionState.RTL):
+            self._mission.land_complete("route_complete")
+        self.toastRequested.emit("Маршрут завершён")
+
     def _route_energy_ok(self, pts: list[tuple[float, float]]) -> bool:
         if not self._latest_telemetry:
             return True
@@ -1969,6 +3356,14 @@ class AppController(QObject):
         return Route(version=1, waypoints=waypoints, active_index=0)
 
     def _resolve_max_distance_m(self) -> float:
+        max_range = getattr(self._energy_model, "max_range_m", None)
+        if callable(max_range):
+            try:
+                resolved = float(max_range())
+                if resolved > 0:
+                    return resolved
+            except Exception:
+                pass
         max_distance_m = float(getattr(settings, "max_flight_distance_m", 15000.0) or 0.0)
         if max_distance_m > 0:
             return max_distance_m
@@ -1988,15 +3383,17 @@ class AppController(QObject):
                     return WorldCoord(lat=float(lat), lon=float(lon))
                 except (TypeError, ValueError):
                     pass
+        if route.waypoints:
+            wp = route.waypoints[0]
+            return WorldCoord(lat=wp.lat, lon=wp.lon)
+        if math.isfinite(float(telemetry.lat)) and math.isfinite(float(telemetry.lon)):
+            return WorldCoord(lat=telemetry.lat, lon=telemetry.lon)
         center = getattr(settings, "map_center", None)
         if isinstance(center, (list, tuple)) and len(center) >= 2:
             try:
                 return WorldCoord(lat=float(center[0]), lon=float(center[1]))
             except (TypeError, ValueError):
                 pass
-        if route.waypoints:
-            wp = route.waypoints[0]
-            return WorldCoord(lat=wp.lat, lon=wp.lon)
         return WorldCoord(lat=telemetry.lat, lon=telemetry.lon)
 
     def _resolve_uav_id(self, sample: TelemetrySample) -> str:
@@ -2015,6 +3412,11 @@ class AppController(QObject):
         self._active_path.set_rtl(deps.rtl_path)
         self.map_bridge.render_map()
         return True
+
+    def _send_unreal_despawn(self) -> bool:
+        if self._backend != "unreal" or self._unreal_link is None:
+            return False
+        return self._unreal_link.send_command("DESPAWN")
 
     def _build_rtl_route(self) -> Route | None:
         if self._latest_telemetry is None:
@@ -2076,6 +3478,14 @@ class AppController(QObject):
         now = time.perf_counter()
         if self._last_detection_ts is not None and (now - self._last_detection_ts) > 2.0:
             self._detection_conf = 0.0
+        camera_age = self._camera_monitor.age_s()
+        if camera_age is None or camera_age > 2.0:
+            self._fps = 0.0
+        else:
+            try:
+                self._fps = max(0.0, float(self._camera_monitor.fps))
+            except Exception:
+                self._fps = 0.0
         bus_alive = self._last_detection_ts is not None and (now - self._last_detection_ts) < 2.0
         if bus_alive != self._bus_alive:
             self._bus_alive = bus_alive
@@ -2103,11 +3513,23 @@ class AppController(QObject):
     def _log_detection_event(
         self, detections: list[object], best_conf: float, bbox: tuple[int, int, int, int] | None
     ) -> None:
+        if not detections:
+            return
+        now = time.monotonic()
         classes = [
             int(getattr(d, "class_id", getattr(d, "cls", -1)))
             for d in detections
             if hasattr(d, "class_id") or hasattr(d, "cls")
         ]
+        class_sig = tuple(classes)
+        sig = (len(detections), class_sig, bbox)
+        log_now = True
+        if self._last_detection_log_ts is not None and self._last_detection_sig == sig:
+            if (now - self._last_detection_log_ts) < 2.0:
+                log_now = False
+        if log_now:
+            self._last_detection_log_ts = now
+            self._last_detection_sig = sig
         payload = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "count": len(detections),
@@ -2116,14 +3538,14 @@ class AppController(QObject):
             "classes": classes,
             "detections": [self._serialize_detection(d) for d in detections],
         }
-        _log.info(
-            "Detection summary | count=%d best=%.2f classes=%s bbox=%s",
-            len(detections),
-            best_conf,
-            classes or "n/a",
-            bbox,
-        )
-        _log.info("Detection JSON %s", json.dumps(payload, ensure_ascii=False))
+        if log_now:
+            _log.warning(
+                "Detection | count=%d best=%.2f classes=%s bbox=%s",
+                len(detections),
+                best_conf,
+                classes or "n/a",
+                bbox,
+            )
         self._write_detection_json(payload)
 
     def _serialize_detection(self, det: object) -> dict[str, object]:
@@ -2170,24 +3592,55 @@ class MainWindow(QObject):
         super().__init__()
         self.det_vm = DetectorVM()
         self.plan_vm = PlannerVM()
+        self._backend = resolve_driver_type(settings)
+        self._use_unreal = self._backend == "unreal"
+        self._unreal_detection_source = str(
+            getattr(settings, "unreal_detection_source", "local_yolo") or "local_yolo"
+        ).lower()
+        if self._unreal_detection_source not in ("backend", "local_yolo", "both"):
+            self._unreal_detection_source = "local_yolo"
+        self._unreal_local_yolo_enabled = self._use_unreal and self._unreal_detection_source in (
+            "local_yolo",
+            "both",
+        )
+        self._unreal_forwarded_object_seen_ts: dict[str, float] = {}
         self._frame_q = deps.frame_queue
         self._cam_fps = getattr(settings, "camera_fps", 30)
         self._camera_index = 0
-        self._camera_candidates: list[int] = self._probe_cameras()
+        self._camera_candidates: list[int] = [] if self._use_unreal else self._probe_cameras()
 
         # Optional camera/detector threads
-        try:
-            self.cam_thr = deps.get_camera()
-            self.det_thr = deps.get_detector()
-            self._have_camera = True
-            self._camera_index = getattr(self.cam_thr, "index", 0)
-            if self._camera_index not in self._camera_candidates:
-                self._camera_candidates.insert(0, self._camera_index)
-            self.cam_thr.frame.connect(self._on_frame)
-            self.cam_thr.error.connect(lambda msg: self.app.toastRequested.emit(msg))
-        except RuntimeError:
+        if not self._use_unreal:
+            try:
+                self.cam_thr = deps.get_camera()
+                self.det_thr = deps.get_detector()
+                self._have_camera = True
+                self._camera_index = getattr(self.cam_thr, "index", 0)
+                if self._camera_index not in self._camera_candidates:
+                    self._camera_candidates.insert(0, self._camera_index)
+                self.cam_thr.frame.connect(self._on_frame)
+                self.cam_thr.error.connect(lambda msg: self.app.toastRequested.emit(msg))
+            except RuntimeError:
+                self.cam_thr = None
+                self.det_thr = None
+                self._have_camera = False
+        else:
             self.cam_thr = None
-            self.det_thr = None
+            if self._unreal_local_yolo_enabled:
+                try:
+                    self.det_thr = deps.get_detector()
+                    _log.info(
+                        "Unreal mode local YOLO detector thread created (source=%s)",
+                        self._unreal_detection_source,
+                    )
+                except RuntimeError:
+                    self.det_thr = None
+                    _log.warning(
+                        "Unreal local YOLO requested but detect_factory is not configured (source=%s)",
+                        self._unreal_detection_source,
+                    )
+            else:
+                self.det_thr = None
             self._have_camera = False
 
         # Register components before QML triggers APP_START so start_all() sees them.
@@ -2204,12 +3657,55 @@ class MainWindow(QObject):
             camera_available=self._have_camera,
             camera_switcher=self._cycle_camera,
         )
-        self._debug_sim = DebugSimulationService(
-            route_provider=self.app.get_active_path_for_sim,
-            telemetry_callback=self.app.on_telemetry,
-            frame_callback=self._on_frame,
-        )
-        self.app.attach_debug_sim(self._debug_sim)
+        self._debug_sim: DebugSimulationService | None = None
+        self._unreal_link: UnrealLinkService | None = None
+        if not self._use_unreal:
+            self._debug_sim = DebugSimulationService(
+                route_provider=self.app.get_active_path_for_sim,
+                telemetry_callback=self.app.on_telemetry,
+                frame_callback=self._on_frame,
+            )
+            self.app.attach_debug_sim(self._debug_sim)
+        else:
+            base_url = str(getattr(settings, "unreal_base_url", "http://127.0.0.1:9000"))
+            uav_id = str(getattr(settings, "uav_id", None) or "sim")
+            camera_mode = str(
+                getattr(settings, "unreal_video_mode", "h264_stream") or "h264_stream"
+            ).lower()
+            video_endpoint = str(getattr(settings, "unreal_video_endpoint", "/sim/v1/video.ts"))
+            video_fps = float(getattr(settings, "unreal_video_target_fps", 15.0) or 15.0)
+            video_reconnect_s = float(
+                getattr(settings, "unreal_video_reconnect_s", 1.0) or 1.0
+            )
+            telemetry_hz = float(getattr(settings, "unreal_telemetry_hz", 6.0) or 6.0)
+            detections_hz = float(getattr(settings, "unreal_detections_hz", 1.0) or 1.0)
+            camera_hz = float(getattr(settings, "unreal_camera_hz", 8.0) or 8.0)
+            if self._unreal_detection_source == "local_yolo":
+                detections_hz = 0.0
+            unreal_detections_cb = (
+                self._on_unreal_detections if self._unreal_detection_source in ("backend", "both") else None
+            )
+            self._unreal_link = UnrealLinkService(
+                base_url=base_url,
+                uav_id=uav_id,
+                telemetry_hz=telemetry_hz,
+                detections_hz=detections_hz,
+                camera_hz=camera_hz,
+                camera_mode=camera_mode,
+                video_endpoint=video_endpoint,
+                video_target_fps=video_fps,
+                video_reconnect_s=video_reconnect_s,
+                on_telemetry=self.app.on_telemetry,
+                on_camera_frame=self.app.on_camera_image,
+                on_detections=unreal_detections_cb,
+                on_link_status=self.app.on_unreal_link_status,
+                on_camera_status=self.app.on_unreal_camera_status,
+                on_camera_info=self.app.on_unreal_camera_info,
+                on_map_ready=self.app.set_unreal_static_map,
+                on_warning=lambda msg: self.app.toastRequested.emit(msg),
+            )
+            self.app.attach_unreal_link(self._unreal_link)
+            self._unreal_link.start()
 
         # QML engine + context
         self._engine = QQmlApplicationEngine()
@@ -2236,6 +3732,26 @@ class MainWindow(QObject):
             except Exception:
                 pass
         self.app.on_frame(frame)
+
+    def _on_unreal_detections(self, batch: object, objects: list[dict[str, object]]) -> None:
+        """
+        Unreal detections do not include image-space bounding boxes.
+        They must NOT go through the local detector pipeline (Event.DETECTION),
+        otherwise QML/DetectorVM may crash on bbox=None.
+        """
+        # Do NOT: bus.emit(Event.DETECTION, batch)
+
+        # Still push confirmed objects (map targets, list, orbit, etc.)
+        if self._unreal_detection_source == "local_yolo":
+            return
+        self.app.process_backend_detections(objects)
+
+    def stop_services(self) -> None:
+        if self._unreal_link is not None:
+            try:
+                self._unreal_link.stop()
+            except Exception:
+                pass
 
     # ---------- camera helpers ---------- #
     def _probe_cameras(self, limit: int = 5) -> list[int]:
@@ -2309,3 +3825,5 @@ class MainWindow(QObject):
         self.app.set_camera_available(True)
         self.app.toastRequested.emit(f"Camera switched to #{index}")
         return True
+
+

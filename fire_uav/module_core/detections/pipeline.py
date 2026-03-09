@@ -19,6 +19,7 @@ from fire_uav.module_core.detections.smoothing import build_smoother
 from fire_uav.module_core.factories import get_geo_projector
 from fire_uav.module_core.interfaces.geo import IGeoProjector
 from fire_uav.module_core.schema import GeoDetection, TelemetrySample, WorldCoord
+from fire_uav.services.targets.target_tracker import TargetObservation, TargetTracker
 from fire_uav.services.telemetry.transmitter import Transmitter
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,7 @@ class DetectionPipeline:
         visualizer_adapter=None,
         loop=None,
         detection_callback: Callable[[datetime], None] | None = None,
+        target_tracker: TargetTracker | None = None,
     ) -> None:
         self.aggregator = aggregator or DetectionAggregator(
             window=settings.agg_window,
@@ -68,8 +70,14 @@ class DetectionPipeline:
             max_distance_m=settings.agg_max_distance_m,
             ttl_seconds=settings.agg_ttl_seconds,
         )
+        resolved_camera = camera_params
         # Prefer native geo projector when available; falls back to Python implementation.
-        self.projector = projector or get_geo_projector(settings)
+        self.projector = projector or get_geo_projector(settings, camera=resolved_camera)
+        if camera_params is not None and hasattr(self.projector, "set_camera_params"):
+            try:
+                self.projector.set_camera_params(camera_params)  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                logger.debug("Failed to apply explicit camera params to projector", exc_info=True)
         self.transmitter = transmitter
         self._smoother = build_smoother(settings)
         self._registry = ObjectRegistry()
@@ -79,6 +87,12 @@ class DetectionPipeline:
             writer=JsonNotificationWriter(notifications_dir),
             logger=logger,
             uav_id=getattr(settings, "uav_id", None),
+        )
+        self._target_tracker = target_tracker or TargetTracker(
+            match_radius_m=float(getattr(settings, "match_radius_m", 30.0) or 30.0),
+            suppression_radius_m=float(getattr(settings, "suppression_radius_m", 60.0) or 60.0),
+            suppression_ttl_s=float(getattr(settings, "suppression_ttl_s", 180.0) or 180.0),
+            stable_frames_n=int(getattr(settings, "stable_frames_n", 1) or 1),
         )
         self._lock = Lock()
         self._visualizer = visualizer_adapter
@@ -92,12 +106,21 @@ class DetectionPipeline:
         events: List[DetectionEvent] = []
         smoothed = self._smoother.assign_and_smooth(payload.detections)
         for det, smoothed_bbox, track_id in smoothed:
-            lat, lon = self.projector.project_bbox_to_ground(
+            projected = self.projector.project_bbox_to_ground(
                 payload.telemetry,
                 smoothed_bbox,
                 payload.frame_width,
                 payload.frame_height,
             )
+            if projected is None:
+                logger.debug(
+                    "Detection projection skipped: frame=%s bbox=%s track_id=%s reason=invalid_ground_intersection",
+                    det.frame_id or payload.frame_id,
+                    smoothed_bbox,
+                    track_id,
+                )
+                continue
+            lat, lon = projected
             coord = WorldCoord(lat=lat, lon=lon)
             events.append(
                 DetectionEvent(
@@ -116,14 +139,15 @@ class DetectionPipeline:
         with self._lock:
             aggregated = self.aggregator.add_many(events)
 
-        if aggregated:
-            for det in aggregated:
+        confirmed = self._collect_stable_confirmations(aggregated)
+        if confirmed:
+            for det in confirmed:
                 self._notification_manager.handle_confirmed_detection(det)
                 self._publish_visualizer(det)
             if self._detection_callback:
-                self._detection_callback(aggregated[-1].timestamp or datetime.utcnow())
-        self._transmit(aggregated)
-        return aggregated
+                self._detection_callback(confirmed[-1].timestamp or datetime.utcnow())
+        self._transmit(confirmed)
+        return confirmed
 
     # ------------------------------------------------------------------ #
     def _transmit(self, detections: Sequence[GeoDetection]) -> None:
@@ -157,3 +181,37 @@ class DetectionPipeline:
             asyncio.run_coroutine_threadsafe(self._visualizer.publish_object(det), self._loop)
         else:
             logger.debug("Visualizer adapter provided without event loop; skipping publish_object.")
+
+    def _collect_stable_confirmations(self, detections: Sequence[GeoDetection]) -> list[GeoDetection]:
+        if not detections:
+            return []
+        confirmed: list[GeoDetection] = []
+        with self._lock:
+            for det in detections:
+                updates = self._target_tracker.update(
+                    [
+                        TargetObservation(
+                            class_label=str(det.class_id),
+                            lat=det.lat,
+                            lon=det.lon,
+                            timestamp=det.timestamp,
+                            confidence=det.confidence,
+                        )
+                    ]
+                )
+                if not updates or not updates[0].should_confirm:
+                    continue
+                update = updates[0]
+                confirmed.append(
+                    GeoDetection(
+                        class_id=det.class_id,
+                        confidence=det.confidence,
+                        lat=update.track.lat,
+                        lon=update.track.lon,
+                        alt=det.alt,
+                        timestamp=det.timestamp,
+                        frame_id=det.frame_id,
+                        track_id=update.track.track_id,
+                    )
+                )
+        return confirmed

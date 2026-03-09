@@ -72,5 +72,8 @@ class ManagedComponent(threading.Thread, ABC):
             self._stop_event.set()
 
     def join(self, timeout: float | None = JOIN_TIMEOUT_DEFAULT) -> None:
+        if self.ident is None:
+            self._log.debug("Join skipped for non-started thread")
+            return
         super().join(timeout)
         self._log.debug("Joined (%s)", "timed-out" if self.is_alive() else "clean")

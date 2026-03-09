@@ -42,6 +42,7 @@ class DebugSimulationService:
         self._progress = 0.0
         self._distance_m = 0.0
         self._last_pos: tuple[float, float] | None = None
+        self._last_alt: float | None = None
         self._speed_mps = 8.0
         self._max_distance_m = float(getattr(settings, "max_flight_distance_m", 15000.0) or 15000.0)
         self._completed = False
@@ -85,6 +86,7 @@ class DebugSimulationService:
         self._progress = 0.0
         self._distance_m = 0.0
         self._last_pos = None
+        self._last_alt = None
         self._last_tick = time.monotonic()
         self._completed = False
 
@@ -131,9 +133,11 @@ class DebugSimulationService:
         deps.debug_flight_progress = self._progress
         deps.debug_flight_completed = bool(self._completed)
         prev_pos = self._last_pos
+        prev_alt = self._last_alt
+        current_alt = 120.0
         if prev_pos is not None and not self._completed:
             self._distance_m += haversine_m(prev_pos, pos)
-        vx = vy = vz = None
+        vx = vy = vz = 0.0
         if prev_pos is not None and dt > 0:
             lat1, lon1 = prev_pos
             lat2, lon2 = pos
@@ -142,7 +146,8 @@ class DebugSimulationService:
             dy = math.radians(lat2 - lat1) * EARTH_RADIUS_M
             vx = dx / dt
             vy = dy / dt
-            vz = 0.0
+            if prev_alt is not None:
+                vz = (current_alt - prev_alt) / dt
         source_id = str(getattr(settings, "uav_id", None) or "uav")
         if self._bridge_mode:
             source = source_id
@@ -157,7 +162,7 @@ class DebugSimulationService:
         sample = TelemetrySample(
             lat=pos[0],
             lon=pos[1],
-            alt=120.0,
+            alt=current_alt,
             yaw=(self._progress * 360.0) % 360.0,
             pitch=0.0,
             roll=0.0,
@@ -170,6 +175,7 @@ class DebugSimulationService:
             source=source,
         )
         self._last_pos = pos
+        self._last_alt = current_alt
         self._telemetry_callback(sample)
 
     def _on_camera_tick(self) -> None:

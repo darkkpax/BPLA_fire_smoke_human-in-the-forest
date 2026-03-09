@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable
 
 from fire_uav.services.bus import Event, bus
@@ -64,6 +64,7 @@ class ConfirmedObjectsStore:
         object_id = str(payload.get("object_id", ""))
         if not object_id:
             return
+        timestamp = self._parse_timestamp(payload.get("timestamp"))
         obj = ConfirmedObject(
             object_id=object_id,
             class_id=int(payload.get("class_id", -1)),
@@ -71,7 +72,7 @@ class ConfirmedObjectsStore:
             lat=float(payload.get("lat", 0.0)),
             lon=float(payload.get("lon", 0.0)),
             track_id=payload.get("track_id"),
-            timestamp=payload.get("timestamp"),
+            timestamp=timestamp,
         )
         is_new = object_id not in self._objects
         self._objects[object_id] = obj
@@ -85,6 +86,27 @@ class ConfirmedObjectsStore:
                 )
         if self._on_change:
             self._on_change()
+
+    @staticmethod
+    def _parse_timestamp(value: object) -> datetime | None:
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value
+            return value.astimezone(timezone.utc)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                if text.endswith("Z"):
+                    text = f"{text[:-1]}+00:00"
+                parsed = datetime.fromisoformat(text)
+                if parsed.tzinfo is None:
+                    return parsed
+                return parsed.astimezone(timezone.utc)
+            except ValueError:
+                return None
+        return None
 
 
 __all__ = ["ConfirmedObjectsStore", "ConfirmedObject"]

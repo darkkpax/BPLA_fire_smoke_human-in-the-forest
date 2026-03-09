@@ -34,20 +34,20 @@ class PythonRoutePlanner(IRoutePlanner):
                 except (TypeError, ValueError):
                     pass
 
+        if route.waypoints:
+            wp = route.waypoints[0]
+            return WorldCoord(lat=wp.lat, lon=wp.lon)
+
+        if telemetry is not None:
+            return WorldCoord(lat=telemetry.lat, lon=telemetry.lon)
+
         center = getattr(self.settings, "map_center", None)
         if isinstance(center, (list, tuple)) and len(center) >= 2:
             try:
                 return WorldCoord(lat=float(center[0]), lon=float(center[1]))
             except (TypeError, ValueError):
                 pass
-
-        if route.waypoints:
-            wp = route.waypoints[0]
-            return WorldCoord(lat=wp.lat, lon=wp.lon)
-
-        if telemetry is None:
-            return None
-        return WorldCoord(lat=telemetry.lat, lon=telemetry.lon)
+        return None
 
     def plan_route(self, geom_wkt: str, gsd_cm: int | float = 0) -> Route:
         missions = build_route(geom_wkt, int(gsd_cm) if gsd_cm else 0, settings=self.settings)

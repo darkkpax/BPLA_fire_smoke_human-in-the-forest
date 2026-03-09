@@ -7,6 +7,8 @@ from queue import Queue
 import cv2
 
 import fire_uav.infrastructure.providers as deps
+from fire_uav.config import settings
+from fire_uav.module_core.drivers.registry import resolve_driver_type
 from fire_uav.services.bus import Event, bus
 from fire_uav.services.components.camera import CameraThread
 from fire_uav.services.components.detect import DetectThread
@@ -58,6 +60,28 @@ def init_ground_core(*, fps: int = 30) -> None:
 
     deps.frame_queue = Queue(maxsize=5)
     deps.dets_queue = Queue(maxsize=5)
+
+    if resolve_driver_type(settings) == "unreal":
+        deps.camera_factory = None
+        detection_source = str(
+            getattr(settings, "unreal_detection_source", "local_yolo") or "local_yolo"
+        ).lower()
+        if detection_source in ("local_yolo", "both"):
+            deps.detect_factory = lambda: DetectThread(
+                in_q=deps.frame_queue,
+                out_q=deps.dets_queue,
+            )
+            _log.info(
+                "Unreal backend active - local YOLO detector enabled (source=%s)",
+                detection_source,
+            )
+        else:
+            deps.detect_factory = None
+            _log.info("Unreal backend active - skipping local detector (source=%s)", detection_source)
+        deps.lifecycle_manager = LifecycleManager()
+        bus.subscribe(Event.APP_START, lambda *_: deps.get_lifecycle().start_all())
+        bus.subscribe(Event.APP_STOP, lambda *_: deps.get_lifecycle().stop_all())
+        return
 
     if _camera_available():
         deps.camera_factory = lambda: QtCameraThread(

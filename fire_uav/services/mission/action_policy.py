@@ -12,6 +12,7 @@ class MissionActionPolicy:
     can_start_flight: bool
     can_edit_route: bool
     can_apply_route_edits: bool
+    can_open_orbit: bool
     can_orbit: bool
     can_rtl: bool
     can_send_rtl_route: bool
@@ -65,20 +66,31 @@ class MissionActionPolicy:
         can_orbit = (
             mission_state == MissionState.IN_FLIGHT
             and commands_enabled
-            and camera_ok
+            and telemetry_available
             and confirmed_object_count > 0
             and (confirmed_object_count == 1 or selected_object_id is not None)
             and supports_orbit
         )
+        can_open_orbit = (
+            mission_state == MissionState.IN_FLIGHT
+            and commands_enabled
+            and telemetry_available
+            and confirmed_object_count > 0
+            and supports_orbit
+        )
         can_rtl = mission_state == MissionState.IN_FLIGHT and commands_enabled and link_ok and supports_rtl
         can_send_rtl_route = mission_state == MissionState.RTL and link_ok and supports_waypoints
-        can_complete_landing = mission_state == MissionState.RTL and at_home
+        can_complete_landing = (
+            (mission_state == MissionState.RTL and at_home)
+            or mission_state == MissionState.POSTFLIGHT
+        )
         can_abort_to_preflight = mission_state in (MissionState.IN_FLIGHT, MissionState.RTL)
         return cls(
             can_confirm_plan=can_confirm_plan,
             can_start_flight=can_start_flight,
             can_edit_route=can_edit_route,
             can_apply_route_edits=can_apply_route_edits,
+            can_open_orbit=can_open_orbit,
             can_orbit=can_orbit,
             can_rtl=can_rtl,
             can_send_rtl_route=can_send_rtl_route,

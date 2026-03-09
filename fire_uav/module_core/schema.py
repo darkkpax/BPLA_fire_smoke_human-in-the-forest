@@ -25,7 +25,13 @@ class TelemetrySample(BaseModel):
 
     lat: float = Field(..., ge=-90, le=90)
     lon: float = Field(..., ge=-180, le=180)
-    alt: float = Field(..., ge=0, alias="alt_m", description="Altitude above takeoff point, m")
+    alt: float = Field(..., ge=0, alias="alt_m", description="Altitude in world geo frame, m")
+    alt_agl: float | None = Field(
+        default=None,
+        ge=0.0,
+        alias="alt_agl_m",
+        description="Altitude above local ground level, m",
+    )
     yaw: float = Field(0.0, alias="yaw_deg", description="Heading/yaw angle in degrees")
     pitch: float = Field(0.0, alias="pitch_deg")
     roll: float = Field(0.0, alias="roll_deg")
@@ -36,6 +42,11 @@ class TelemetrySample(BaseModel):
     battery_percent: float | None = Field(
         default=None, ge=0.0, le=100.0, description="Remaining battery, 0..100 (%)"
     )
+    status: str | None = None
+    flight_mode: str | None = None
+    camera_mount_pitch_deg: float | None = None
+    camera_mount_yaw_deg: float | None = None
+    camera_mount_roll_deg: float | None = None
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     source: str | None = Field(
         default=None,

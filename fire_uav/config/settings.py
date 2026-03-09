@@ -19,10 +19,23 @@ class Settings:
     # Runtime role/adapter
     profile: Literal["dev", "demo", "jetson"] = "dev"
     role: str = "ground"
-    uav_backend: str = "stub"
+    uav_backend: str = "unreal"
     driver_type: str = ""
     mavlink_connection_string: str = "udp:127.0.0.1:14550"
     unreal_base_url: str = "http://127.0.0.1:9000"
+    unreal_video_mode: str = "jpeg_snapshots"
+    unreal_video_endpoint: str = "/sim/v1/video.ts"
+    unreal_video_target_fps: float = 20.0
+    unreal_video_reconnect_s: float = 1.0
+    unreal_camera_hz: float = 8.0
+    unreal_telemetry_hz: float = 6.0
+    unreal_detections_hz: float = 1.0
+    unreal_detection_source: str = "local_yolo"
+    unreal_local_detect_hz: float = 5.0
+    camera_fov_deg: float = 82.1
+    camera_mount_pitch_deg: float = 90.0
+    camera_mount_yaw_deg: float = 0.0
+    camera_mount_roll_deg: float = 0.0
     custom_sdk_config: dict = field(default_factory=dict)
     use_native_core: bool = False
     use_ortools: bool = True
@@ -70,6 +83,10 @@ class Settings:
     agg_min_confidence: float = 0.6
     agg_max_distance_m: float = 35.0
     agg_ttl_seconds: float = 8.0
+    match_radius_m: float = 30.0
+    suppression_radius_m: float = 60.0
+    suppression_ttl_s: float = 180.0
+    stable_frames_n: int = 1
 
     # ------------------------ #
     map_provider: str = "openlayers_de"
@@ -79,6 +96,11 @@ class Settings:
     gsd_cm: float = 3.0
     side_overlap: float = 0.7
     front_overlap: float = 0.8
+    auto_orbit_enabled: bool = False
+    orbit_radius_m: float = 50.0
+    orbit_points_per_circle: int = 12
+    orbit_loops: int = 1
+    maneuver_alt_m: float | None = None
     battery_wh: float = 4500.0
     no_fly_geojson: str = "data/no_fly_zones.geojson"
     max_flight_distance_m: float = 15000.0
@@ -107,6 +129,39 @@ class Settings:
                 "mavlink_connection_string", defaults.mavlink_connection_string
             ),
             unreal_base_url=data.get("unreal_base_url", defaults.unreal_base_url),
+            unreal_video_mode=str(data.get("unreal_video_mode", defaults.unreal_video_mode)),
+            unreal_video_endpoint=str(
+                data.get("unreal_video_endpoint", defaults.unreal_video_endpoint)
+            ),
+            unreal_video_target_fps=float(
+                data.get("unreal_video_target_fps", defaults.unreal_video_target_fps)
+            ),
+            unreal_video_reconnect_s=float(
+                data.get("unreal_video_reconnect_s", defaults.unreal_video_reconnect_s)
+            ),
+            unreal_camera_hz=float(data.get("unreal_camera_hz", defaults.unreal_camera_hz)),
+            unreal_telemetry_hz=float(
+                data.get("unreal_telemetry_hz", defaults.unreal_telemetry_hz)
+            ),
+            unreal_detections_hz=float(
+                data.get("unreal_detections_hz", defaults.unreal_detections_hz)
+            ),
+            unreal_detection_source=str(
+                data.get("unreal_detection_source", defaults.unreal_detection_source)
+            ),
+            unreal_local_detect_hz=float(
+                data.get("unreal_local_detect_hz", defaults.unreal_local_detect_hz)
+            ),
+            camera_fov_deg=float(data.get("camera_fov_deg", defaults.camera_fov_deg)),
+            camera_mount_pitch_deg=float(
+                data.get("camera_mount_pitch_deg", defaults.camera_mount_pitch_deg)
+            ),
+            camera_mount_yaw_deg=float(
+                data.get("camera_mount_yaw_deg", defaults.camera_mount_yaw_deg)
+            ),
+            camera_mount_roll_deg=float(
+                data.get("camera_mount_roll_deg", defaults.camera_mount_roll_deg)
+            ),
             custom_sdk_config=data.get("custom_sdk_config", defaults.custom_sdk_config),
             use_native_core=bool(data.get("use_native_core", defaults.use_native_core)),
             use_ortools=bool(data.get("use_ortools", defaults.use_ortools)),
@@ -162,6 +217,12 @@ class Settings:
             agg_min_confidence=float(data.get("agg_min_confidence", defaults.agg_min_confidence)),
             agg_max_distance_m=float(data.get("agg_max_distance_m", defaults.agg_max_distance_m)),
             agg_ttl_seconds=float(data.get("agg_ttl_seconds", defaults.agg_ttl_seconds)),
+            match_radius_m=float(data.get("match_radius_m", defaults.match_radius_m)),
+            suppression_radius_m=float(
+                data.get("suppression_radius_m", defaults.suppression_radius_m)
+            ),
+            suppression_ttl_s=float(data.get("suppression_ttl_s", defaults.suppression_ttl_s)),
+            stable_frames_n=int(data.get("stable_frames_n", defaults.stable_frames_n)),
             map_provider=str(data.get("map_provider", defaults.map_provider)),
             static_map_image_path=data.get("static_map_image_path", defaults.static_map_image_path),
             static_map_bounds=static_bounds,
@@ -169,6 +230,17 @@ class Settings:
             gsd_cm=float(data.get("gsd_cm", defaults.gsd_cm)),
             side_overlap=float(data.get("side_overlap", defaults.side_overlap)),
             front_overlap=float(data.get("front_overlap", defaults.front_overlap)),
+            auto_orbit_enabled=bool(data.get("auto_orbit_enabled", defaults.auto_orbit_enabled)),
+            orbit_radius_m=float(data.get("orbit_radius_m", defaults.orbit_radius_m)),
+            orbit_points_per_circle=int(
+                data.get("orbit_points_per_circle", defaults.orbit_points_per_circle)
+            ),
+            orbit_loops=int(data.get("orbit_loops", defaults.orbit_loops)),
+            maneuver_alt_m=(
+                None
+                if data.get("maneuver_alt_m", defaults.maneuver_alt_m) is None
+                else float(data.get("maneuver_alt_m"))
+            ),
             battery_wh=float(data.get("battery_wh", defaults.battery_wh)),
             no_fly_geojson=str(data.get("no_fly_geojson", defaults.no_fly_geojson)),
             max_flight_distance_m=float(

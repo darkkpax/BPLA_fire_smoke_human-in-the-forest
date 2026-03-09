@@ -39,6 +39,11 @@ ApplicationWindow {
     property string toastMessage: ""
     property var orbitSelection: []
     property bool lastRouteEditMode: false
+    property bool overlayActive: false
+
+    onCurrentTabChanged: {
+        if (hasApp) app.setVideoVisible(currentTab === 0);
+    }
 
     function runMapTool(name, arg) {
         if (!mapView) return;
@@ -63,7 +68,7 @@ ApplicationWindow {
     }
     Connections {
         target: hasApp ? app : null
-        function onRouteEditModeChanged() {
+        function onFlightControlsChanged() {
             if (!hasApp) return;
             var next = app.routeEditMode;
             if (next === root.lastRouteEditMode) return;
@@ -84,22 +89,73 @@ ApplicationWindow {
 
         Rectangle {
             id: debugLauncher
-            width: 162
-            height: 38
+            width: 176
+            height: 44
             radius: height / 2
             anchors.top: parent.top
             anchors.right: parent.right
-            anchors.topMargin: 16
-            anchors.rightMargin: 18
-            color: Qt.rgba(0.1, 0.12, 0.18, 0.7)
-            border.color: Qt.rgba(1, 1, 1, 0.18)
-            border.width: 1
+            anchors.topMargin: 22
+            anchors.rightMargin: 24
+            color: "transparent"
             z: 200
+            clip: true
+
+            ShaderEffectSource {
+                id: debugSlice
+                anchors.fill: parent
+                sourceItem: sceneLayer
+                sourceRect: Qt.rect(debugLauncher.x, debugLauncher.y, debugLauncher.width, debugLauncher.height)
+                recursive: true
+                live: root.visible
+                visible: false
+            }
+
+            FastBlur {
+                id: debugBlur
+                anchors.fill: parent
+                source: debugSlice
+                radius: 18
+                transparentBorder: true
+                visible: true
+                z: -3
+            }
+
+            OpacityMask {
+                anchors.fill: parent
+                source: debugBlur
+                maskSource: Rectangle {
+                    width: debugLauncher.width
+                    height: debugLauncher.height
+                    radius: debugLauncher.radius
+                }
+                z: -2
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                radius: debugLauncher.radius
+                color: Qt.rgba(0.08, 0.08, 0.08, 0.18)
+                border.color: Qt.rgba(1, 1, 1, 0.18)
+                border.width: 1
+                z: -1
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                radius: debugLauncher.radius
+                gradient: Gradient {
+                    GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.16) }
+                    GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.07) }
+                }
+                opacity: debugMouse.containsMouse ? 0.30 : 0.18
+                Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
+            }
 
             Row {
                 anchors.fill: parent
-                anchors.margins: 12
-                spacing: 8
+                anchors.leftMargin: 14
+                anchors.rightMargin: 16
+                spacing: 10
 
                 Rectangle {
                     width: 12
@@ -111,33 +167,39 @@ ApplicationWindow {
                 }
 
                 Column {
+                    width: parent.width - 22
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: 0
+                    clip: true
+
                     Text {
                         text: "Debug console"
                         color: textPrimary
                         font.pixelSize: 13
                         font.family: "Inter"
                         font.weight: Font.Medium
+                        elide: Text.ElideRight
+                        width: parent.width
                     }
                     Text {
                         text: hasApp && app.debugMode ? "Flight loop running" : "Flight loop idle"
                         color: textMuted
                         font.pixelSize: 11
                         font.family: "Inter"
+                        elide: Text.ElideRight
+                        width: parent.width
                     }
                 }
             }
 
             MouseArea {
+                id: debugMouse
                 anchors.fill: parent
                 hoverEnabled: true
                 onClicked: {
                     debugWindow.visible = true;
                     debugWindow.raise();
                 }
-                onEntered: debugLauncher.color = Qt.rgba(0.14, 0.18, 0.25, 0.9)
-                onExited: debugLauncher.color = Qt.rgba(0.1, 0.12, 0.18, 0.7)
             }
         }
 
@@ -188,7 +250,7 @@ ApplicationWindow {
                             z: 5
                             Text {
                                 anchors.centerIn: parent
-                                text: "Camera not found"
+                                text: hasApp ? app.cameraStatusDetail : "Camera not found"
                                 color: textPrimary
                                 font.pixelSize: 24
                                 font.bold: true
@@ -215,10 +277,10 @@ ApplicationWindow {
                             ShaderEffectSource {
                                 id: statusSlice
                                 anchors.fill: parent
-                                sourceItem: videoSurface
+                                sourceItem: root.currentTab === 0 ? videoSurface : null
                                 sourceRect: Qt.rect(statusBar.blurOrigin.x, statusBar.blurOrigin.y, statusBar.width, statusBar.height)
                                 recursive: true
-                                live: true
+                                live: root.currentTab === 0 && root.visible
                                 visible: false
                             }
 
@@ -228,6 +290,7 @@ ApplicationWindow {
                                 source: statusSlice
                                 radius: 16
                                 transparentBorder: true
+                                visible: root.currentTab === 0
                                 z: -3
                             }
 
@@ -325,12 +388,27 @@ ApplicationWindow {
                             url: hasApp ? app.mapUrl : ""
                             profile: WebEngineProfile { storageName: "fire-uav"; offTheRecord: true }
                             backgroundColor: "transparent"
+                            property var mapConsoleQueue: []
                             settings {
                                 localContentCanAccessRemoteUrls: true
                                 localContentCanAccessFileUrls: true
                                 javascriptEnabled: true
                                 errorPageEnabled: true
                                 webGLEnabled: true
+                            }
+                            Timer {
+                                id: mapConsoleFlush
+                                interval: 0
+                                running: false
+                                repeat: false
+                                onTriggered: {
+                                    if (!hasApp || mapView.mapConsoleQueue.length === 0) return;
+                                    var pending = mapView.mapConsoleQueue.slice(0);
+                                    mapView.mapConsoleQueue = [];
+                                    for (var i = 0; i < pending.length; i++) {
+                                        app.handleMapConsole(pending[i]);
+                                    }
+                                }
                             }
                             onLoadingChanged: function(loadRequest) {
                                 if (loadRequest.status === WebEngineView.LoadSucceededStatus) {
@@ -348,7 +426,10 @@ ApplicationWindow {
                                 console.error("WebEngine terminated", terminationStatus, exitCode)
                             }
                             onJavaScriptConsoleMessage: function(level, message, lineNumber, sourceID) {
-                                if (hasApp) app.handleMapConsole(message);
+                                if (message.indexOf("PY_") === 0) {
+                                    mapView.mapConsoleQueue.push(message);
+                                    if (!mapConsoleFlush.running) mapConsoleFlush.start();
+                                }
                                 if (message.indexOf("Leaflet failed") !== -1 || message.indexOf("OpenLayers failed") !== -1 || message.indexOf("Map instance not found") !== -1) {
                                     mapOverlay.text = message;
                                 }
@@ -366,10 +447,10 @@ ApplicationWindow {
                             anchors.fill: parent
                             z: 4
                             property bool overlayActive: root.hasApp && (root.homePickModeActive || root.manualTargetModeActive)
-                            visible: overlayActive
+                            visible: mapClickOverlay.overlayActive
                             MouseArea {
                                 anchors.fill: parent
-                                enabled: overlayActive
+                                enabled: mapClickOverlay.overlayActive
                                 hoverEnabled: true
                                 acceptedButtons: Qt.LeftButton
                                 onClicked: {
@@ -392,7 +473,7 @@ ApplicationWindow {
                                 anchors.bottomMargin: 20
                                 radius: 12
                                 color: Qt.rgba(0, 0, 0, 0.65)
-                                visible: overlayActive
+                                visible: mapClickOverlay.overlayActive
                                 implicitWidth: hintText.implicitWidth + 24
                                 implicitHeight: hintText.implicitHeight + 14
 
@@ -475,10 +556,10 @@ ApplicationWindow {
                             ShaderEffectSource {
                                 id: mapSlice
                                 anchors.fill: parent
-                                sourceItem: mapView
+                                sourceItem: root.currentTab === 1 ? mapView : null
                                 sourceRect: Qt.rect(mapControls.blurOrigin.x, mapControls.blurOrigin.y, mapControls.width, mapControls.height)
                                 recursive: true
-                                live: true
+                                live: root.currentTab === 1 && root.visible
                                 opacity: 0.0 // keep texture alive for blur only
                             }
 
@@ -488,6 +569,7 @@ ApplicationWindow {
                                 source: mapSlice
                                 radius: 16
                                 transparentBorder: true
+                                visible: root.currentTab === 1
                                 z: -3
                             }
 
@@ -732,7 +814,7 @@ ApplicationWindow {
                                                 onExited: hovered = false
                                                 onClicked: {
                                                     if (action) action();
-                                                    mapControls.routeMenuVisible = false;
+                                                    mapControls.routeMenuOpen = false;
                                                 }
                                             }
                                         }
@@ -764,6 +846,58 @@ ApplicationWindow {
                                         onLoaded: {
                                             item.label = "Import KML"
                                             item.action = function() { kmlDialog.open(); }
+                                        }
+                                    }
+                                    Rectangle {
+                                        width: routeMenu.width - 20
+                                        height: 1
+                                        color: Qt.rgba(1, 1, 1, 0.12)
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        anchors.topMargin: 4
+                                        anchors.bottomMargin: 4
+                                    }
+                                    Loader {
+                                        sourceComponent: routeMenuItem
+                                        onLoaded: {
+                                            item.label = Qt.binding(function() {
+                                                return hasApp && app.currentBackend === "unreal"
+                                                    ? "[*] Unreal (sim)"
+                                                    : "[ ] Unreal (sim)";
+                                            })
+                                            item.action = function() { if (hasApp) app.setBackend("unreal"); }
+                                        }
+                                    }
+                                    Loader {
+                                        sourceComponent: routeMenuItem
+                                        onLoaded: {
+                                            item.label = Qt.binding(function() {
+                                                return hasApp && app.currentBackend === "mavlink"
+                                                    ? "[*] MAVLink"
+                                                    : "[ ] MAVLink";
+                                            })
+                                            item.action = function() { if (hasApp) app.setBackend("mavlink"); }
+                                        }
+                                    }
+                                    Loader {
+                                        sourceComponent: routeMenuItem
+                                        onLoaded: {
+                                            item.label = Qt.binding(function() {
+                                                return hasApp && app.currentBackend === "stub"
+                                                    ? "[*] Stub"
+                                                    : "[ ] Stub";
+                                            })
+                                            item.action = function() { if (hasApp) app.setBackend("stub"); }
+                                        }
+                                    }
+                                    Loader {
+                                        sourceComponent: routeMenuItem
+                                        onLoaded: {
+                                            item.label = Qt.binding(function() {
+                                                return hasApp && app.currentBackend === "custom"
+                                                    ? "[*] Custom SDK"
+                                                    : "[ ] Custom SDK";
+                                            })
+                                            item.action = function() { if (hasApp) app.setBackend("custom"); }
                                         }
                                     }
                                 }
@@ -814,12 +948,24 @@ ApplicationWindow {
                                 }
                                 Loader {
                                     active: isInFlight && hasApp && app.routeEditMode
+                                    visible: active
                                     sourceComponent: glassButton
                                     onLoaded: {
                                         item.label = "Apply"
                                         item.minWidth = 86
                                         item.enabled = Qt.binding(function() { return hasApp ? app.canApplyRouteEdits : false; })
                                         item.action = function() { if (hasApp) app.applyRouteEdits(); }
+                                    }
+                                }
+                                Loader {
+                                    active: isInFlight && hasApp && app.routeEditMode
+                                    visible: active
+                                    sourceComponent: glassButton
+                                    onLoaded: {
+                                        item.label = "Cancel"
+                                        item.minWidth = 86
+                                        item.enabled = Qt.binding(function() { return hasApp ? app.canCancelRouteEdits : false; })
+                                        item.action = function() { if (hasApp) app.cancelRouteEdits(); }
                                     }
                                 }
                                 Item {
@@ -838,7 +984,7 @@ ApplicationWindow {
                                             onLoaded: {
                                                 item.label = "Orbit target"
                                                 item.minWidth = 120
-                                                item.enabled = Qt.binding(function() { return hasApp ? app.canOrbit : false; })
+                                                item.enabled = Qt.binding(function() { return hasApp ? app.canOpenOrbit : false; })
                                                 item.openOnHover = true
                                                 item.hoverAction = function(isHover) {
                                                     mapControls.orbitButtonHover = isHover;
@@ -868,7 +1014,7 @@ ApplicationWindow {
                                                     item.label = "Orbit all targets"
                                                     item.minWidth = 150
                                                     item.enabled = Qt.binding(function() {
-                                                        return hasApp ? (app.canOrbit && app.confirmedObjectCount > 0) : false;
+                                                        return hasApp ? app.canOpenOrbit : false;
                                                     })
                                                     item.openOnHover = true
                                                     item.hoverAction = function(isHover) {
@@ -1060,6 +1206,7 @@ ApplicationWindow {
                             Component {
                                 id: mapIconButton
                                 Item {
+                                    id: mapIconButtonRoot
                                     property string icon: "plus"
                                     property var action
                                     property var hoverAction
@@ -1142,12 +1289,12 @@ ApplicationWindow {
                                             if (hoverAction) hoverAction(false);
                                         }
                                         onPressed: {
-                                            pressed = true;
+                                            mapIconButtonRoot.pressed = true;
                                             targetScale = 0.96;
                                         }
                                         onReleased: {
-                                            if (pressed && containsMouse && action) action();
-                                            pressed = false;
+                                            if (mapIconButtonRoot.pressed && containsMouse && action) action();
+                                            mapIconButtonRoot.pressed = false;
                                             targetScale = hovered ? 1.03 : 1.0;
                                         }
                                     }
@@ -1486,6 +1633,270 @@ ApplicationWindow {
                                     onExited: {
                                         mapHud.toolsBridgeHover = false;
                                         mapHud.updateToolsMenu();
+                                    }
+                                }
+                            }
+                        }
+
+                        Item {
+                            id: autoOrbitDock
+                            anchors.horizontalCenter: mapControls.horizontalCenter
+                            anchors.top: mapControls.bottom
+                            anchors.topMargin: 8
+                            width: autoOrbitMenu.width
+                            height: autoOrbitTrigger.height + autoOrbitMenu.height + 10
+                            visible: currentTab === 1
+                            z: 6
+                            property bool triggerHover: false
+                            property bool menuHover: false
+                            property bool bridgeHover: false
+                            property bool menuOpen: triggerHover || menuHover || bridgeHover
+
+                            Item {
+                                id: autoOrbitTrigger
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                anchors.top: parent.top
+                                width: 148
+                                height: 38
+                                scale: autoOrbitTriggerMouse.pressed ? 0.97 : 1.0
+                                Behavior on scale { SpringAnimation { spring: 4; damping: 0.38 } }
+
+                                ShaderEffectSource {
+                                    id: autoOrbitTriggerSlice
+                                    anchors.fill: parent
+                                    sourceItem: mapView
+                                    sourceRect: Qt.rect(autoOrbitDock.x + autoOrbitTrigger.x,
+                                                        autoOrbitDock.y + autoOrbitTrigger.y,
+                                                        autoOrbitTrigger.width,
+                                                        autoOrbitTrigger.height)
+                                    recursive: true
+                                    live: root.currentTab === 1 && root.visible
+                                    visible: false
+                                }
+
+                                FastBlur {
+                                    id: autoOrbitTriggerBlur
+                                    anchors.fill: parent
+                                    source: autoOrbitTriggerSlice
+                                    radius: 16
+                                    transparentBorder: true
+                                    visible: false
+                                    z: -3
+                                }
+
+                                OpacityMask {
+                                    anchors.fill: parent
+                                    source: autoOrbitTriggerBlur
+                                    maskSource: Rectangle {
+                                        width: autoOrbitTrigger.width
+                                        height: autoOrbitTrigger.height
+                                        radius: height / 2
+                                    }
+                                    z: -2
+                                }
+
+                                Rectangle {
+                                    anchors.fill: parent
+                                    radius: height / 2
+                                    color: Qt.rgba(0.08, 0.08, 0.08, 0.42)
+                                    border.color: Qt.rgba(1, 1, 1, 0.16)
+                                    border.width: 1
+                                    z: -1
+                                }
+
+                                Rectangle {
+                                    anchors.fill: parent
+                                    radius: height / 2
+                                    gradient: Gradient {
+                                        GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.14) }
+                                        GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.05) }
+                                    }
+                                    opacity: autoOrbitDock.menuOpen ? 0.32 : 0.22
+                                    Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
+                                }
+
+                                Row {
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 14
+                                    anchors.rightMargin: 14
+                                    spacing: 8
+
+                                    Rectangle {
+                                        width: 10
+                                        height: 10
+                                        radius: 5
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        color: hasApp && app.autoOrbitEnabled ? "#67e8a9" : Qt.rgba(1, 1, 1, 0.32)
+                                        border.color: Qt.rgba(1, 1, 1, 0.2)
+                                    }
+
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: "Auto orbit"
+                                        color: textPrimary
+                                        font.pixelSize: 13
+                                        font.family: "Inter"
+                                        font.bold: hasApp ? app.autoOrbitEnabled : false
+                                    }
+
+                                    Item { width: 1; height: 1; anchors.verticalCenter: parent.verticalCenter }
+
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: Math.round(hasApp ? app.orbitRadiusM : 50) + " m"
+                                        color: hasApp && app.autoOrbitEnabled ? textPrimary : textMuted
+                                        font.pixelSize: 11
+                                        font.family: "Inter"
+                                    }
+                                }
+
+                                MouseArea {
+                                    id: autoOrbitTriggerMouse
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    onEntered: {
+                                        autoOrbitDock.triggerHover = true;
+                                    }
+                                    onExited: {
+                                        autoOrbitDock.triggerHover = false;
+                                    }
+                                    onClicked: {
+                                        if (hasApp) app.setAutoOrbitEnabled(!app.autoOrbitEnabled);
+                                    }
+                                }
+                            }
+
+                            Item {
+                                id: autoOrbitHoverBridge
+                                anchors.top: autoOrbitTrigger.bottom
+                                anchors.horizontalCenter: autoOrbitTrigger.horizontalCenter
+                                width: autoOrbitTrigger.width
+                                height: autoOrbitDock.menuOpen ? 8 : 0
+                                visible: autoOrbitDock.menuOpen
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    onEntered: autoOrbitDock.bridgeHover = true
+                                    onExited: autoOrbitDock.bridgeHover = false
+                                }
+                            }
+
+                            Item {
+                                id: autoOrbitMenu
+                                anchors.horizontalCenter: autoOrbitTrigger.horizontalCenter
+                                anchors.top: autoOrbitHoverBridge.bottom
+                                width: Math.min(252, root.width * 0.42)
+                                height: autoOrbitMenuColumn.implicitHeight + 14
+                                visible: opacity > 0.02
+                                opacity: autoOrbitDock.menuOpen ? 1 : 0
+                                scale: autoOrbitDock.menuOpen ? 1.0 : 0.96
+                                clip: true
+                                Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
+                                Behavior on scale { NumberAnimation { duration: 160; easing.type: Easing.OutQuad } }
+
+                                ShaderEffectSource {
+                                    id: autoOrbitMenuSlice
+                                    anchors.fill: parent
+                                    sourceItem: mapView
+                                    sourceRect: Qt.rect(autoOrbitDock.x + autoOrbitMenu.x,
+                                                        autoOrbitDock.y + autoOrbitMenu.y,
+                                                        autoOrbitMenu.width,
+                                                        autoOrbitMenu.height)
+                                    recursive: true
+                                    live: root.currentTab === 1 && root.visible
+                                    visible: false
+                                }
+
+                                FastBlur {
+                                    id: autoOrbitMenuBlur
+                                    anchors.fill: parent
+                                    source: autoOrbitMenuSlice
+                                    radius: 18
+                                    transparentBorder: true
+                                    visible: false
+                                    z: -3
+                                }
+
+                                OpacityMask {
+                                    anchors.fill: parent
+                                    source: autoOrbitMenuBlur
+                                    maskSource: Rectangle {
+                                        width: autoOrbitMenu.width
+                                        height: autoOrbitMenu.height
+                                        radius: 16
+                                    }
+                                    z: -2
+                                }
+
+                                Rectangle {
+                                    anchors.fill: parent
+                                    radius: 16
+                                    color: Qt.rgba(0.08, 0.08, 0.08, 0.48)
+                                    border.color: Qt.rgba(1, 1, 1, 0.16)
+                                    border.width: 1
+                                    z: -1
+                                }
+
+                                Rectangle {
+                                    anchors.fill: parent
+                                    radius: 16
+                                    gradient: Gradient {
+                                        GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.14) }
+                                        GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.04) }
+                                    }
+                                    opacity: 0.26
+                                }
+
+                                HoverHandler {
+                                    onHoveredChanged: {
+                                        autoOrbitDock.menuHover = hovered;
+                                    }
+                                }
+
+                                ColumnLayout {
+                                    id: autoOrbitMenuColumn
+                                    anchors.fill: parent
+                                    anchors.margins: 10
+                                    spacing: 6
+
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 8
+
+                                        Text {
+                                            text: "Radius"
+                                            color: textMuted
+                                            font.pixelSize: 11
+                                            font.family: "Inter"
+                                            Layout.alignment: Qt.AlignVCenter
+                                        }
+
+                                        Slider {
+                                            id: orbitRadiusSlider
+                                            from: 10
+                                            to: 150
+                                            stepSize: 1
+                                            value: hasApp ? app.orbitRadiusM : 50
+                                            enabled: hasApp
+                                            live: true
+                                            Layout.fillWidth: true
+                                            Layout.alignment: Qt.AlignVCenter
+                                            onMoved: {
+                                                if (hasApp) app.setOrbitRadiusM(value);
+                                            }
+                                            onPressedChanged: {
+                                                if (!pressed && hasApp) app.setOrbitRadiusM(value);
+                                            }
+                                        }
+
+                                        Text {
+                                            text: Math.round(hasApp ? app.orbitRadiusM : orbitRadiusSlider.value) + " m"
+                                            color: textPrimary
+                                            font.pixelSize: 11
+                                            font.family: "Inter"
+                                            Layout.alignment: Qt.AlignVCenter
+                                        }
                                     }
                                 }
                             }
@@ -1891,54 +2302,99 @@ ApplicationWindow {
         property bool plannerActive: currentTab === 1
         property real lift: 0
         width: Math.max(160, (plannerTabLoader.item ? plannerTabLoader.item.width + 72 : 180))
-        height: 34
-        anchors.horizontalCenter: plannerTabLoader.item ? plannerTabLoader.item.horizontalCenter : navFloating.horizontalCenter
+        height: 38
+        anchors.horizontalCenter: navFloating.horizontalCenter
         anchors.bottom: navFloating.top
-        anchors.bottomMargin: 0
+        anchors.bottomMargin: -10
         visible: plannerActive || opacity > 0.02
         opacity: 0
         scale: 0.98
-        z: 60
+        z: 48
         enabled: plannerActive
         transformOrigin: Item.Bottom
 
-        transform: Translate { y: 8 - (8 * updateMapFloating.lift) }
+        transform: Translate { y: 7 - (4 * updateMapFloating.lift) }
 
-        Shape {
-            id: updateMapShape
+        ShaderEffectSource {
+            id: updateMapSlice
             anchors.fill: parent
-            antialiasing: true
+            sourceItem: sceneLayer
+            sourceRect: Qt.rect(updateMapFloating.x, updateMapFloating.y, updateMapFloating.width, updateMapFloating.height)
+            recursive: true
+            live: true
+            visible: false
+        }
 
-            ShapePath {
-                strokeWidth: 0
-                strokeColor: "transparent"
-                fillColor: Qt.rgba(0.08, 0.08, 0.08, 0.35)
-                startX: 18
-                startY: updateMapShape.height
-                PathLine { x: updateMapShape.width - 18; y: updateMapShape.height }
-                PathCubic {
-                    x: updateMapShape.width - 44
-                    y: 5
-                    control1X: updateMapShape.width - 10
-                    control1Y: updateMapShape.height
-                    control2X: updateMapShape.width - 10
-                    control2Y: 18
-                }
-                PathLine { x: 44; y: 5 }
-                PathCubic {
-                    x: 18
-                    y: updateMapShape.height
-                    control1X: 10
-                    control1Y: 18
-                    control2X: 10
-                    control2Y: updateMapShape.height
-                }
+        FastBlur {
+            id: updateMapBlur
+            anchors.fill: parent
+            source: updateMapSlice
+            radius: 16
+            transparentBorder: true
+            visible: false
+            z: -3
+        }
+
+        OpacityMask {
+            anchors.fill: parent
+            source: updateMapBlur
+            maskSource: Rectangle {
+                width: updateMapFloating.width
+                height: updateMapFloating.height
+                radius: height / 2
             }
+            z: -2
+        }
+
+        Rectangle {
+            anchors.fill: parent
+            radius: height / 2
+            color: Qt.rgba(0.08, 0.08, 0.08, 0.42)
+            border.color: Qt.rgba(1, 1, 1, 0.18)
+            border.width: 1
+            z: -1
+        }
+
+        Rectangle {
+            anchors.fill: parent
+            radius: height / 2
+            gradient: Gradient {
+                GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.14) }
+                GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.05) }
+            }
+            opacity: updateMapMouse.containsMouse ? 0.30 : 0.18
+            Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
+        }
+
+        Rectangle {
+            width: parent.width - 44
+            height: 10
+            radius: 5
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: -5
+            color: Qt.rgba(0.08, 0.08, 0.08, 0.18)
+            border.color: "transparent"
+            z: -4
+        }
+
+        Rectangle {
+            width: parent.width - 36
+            height: 8
+            radius: 4
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: -4
+            color: Qt.rgba(0.08, 0.08, 0.08, 0.42)
+            border.color: "transparent"
+            z: 1
         }
 
         Text {
             id: updateMapLabel
-            anchors.centerIn: parent
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.verticalCenterOffset: -4
             text: "Update map"
             color: updateMapFloating.enabled ? textPrimary : textMuted
             font.pixelSize: 13
@@ -1946,10 +2402,11 @@ ApplicationWindow {
         }
 
         MouseArea {
+            id: updateMapMouse
             anchors.fill: parent
             enabled: updateMapFloating.enabled
             hoverEnabled: updateMapFloating.enabled
-            onEntered: updateMapLabel.color = "#7bc6ff"
+            onEntered: updateMapLabel.color = textPrimary
             onExited: updateMapLabel.color = updateMapFloating.enabled ? textPrimary : textMuted
             onPressed: updateMapFloating.scale = 0.97
             onReleased: updateMapFloating.scale = 1.0
@@ -1985,6 +2442,7 @@ ApplicationWindow {
 
     Component.onCompleted: {
         if (!hasApp || !app.cameraAvailable) currentTab = 1;
+        if (hasApp) app.setVideoVisible(currentTab === 0);
     }
 
     DebugWindow { id: debugWindow }

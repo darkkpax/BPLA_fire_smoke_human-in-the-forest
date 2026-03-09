@@ -21,24 +21,31 @@ class PlannerVM:
     def __init__(self) -> None:
         self._route_planner: PythonRoutePlanner = PythonRoutePlanner()
         self._path_backup: list[Tuple[float, float]] | None = None
+        setattr(deps, "active_path_kind", "mission")
 
     # ------------------------------------------------------------------ #
     #                     базовые set / get
     # ------------------------------------------------------------------ #
-    def save_plan(self, pts: list[Tuple[float, float]]) -> None:
-        """Записать путь (lat, lon) во <внешнее> хранилище (deps)."""
-        deps.plan_data = {"path": pts}
+    def save_plan(self, pts: list[Tuple[float, float]], *, path_kind: str = "mission") -> None:
+        """Persist path (lat, lon) into shared deps storage."""
+        deps.plan_data = {"path": pts, "path_kind": path_kind}
+        setattr(deps, "active_path_kind", path_kind)
         self.persist_plan()
 
     def clear_plan(self) -> None:
         """Очистить маршрут и удалить сохранённый артефакт."""
         deps.plan_data = None
+        setattr(deps, "active_path_kind", "mission")
         self._path_backup = None
         self._delete_persisted_plan()
 
     def get_path(self) -> list[Tuple[float, float]]:
         """Вернуть текущий путь или [] если его ещё нет."""
         return (deps.plan_data or {}).get("path", [])
+
+    def get_path_kind(self) -> str:
+        kind = (deps.plan_data or {}).get("path_kind")
+        return kind if kind in ("mission", "maneuver") else "mission"
 
     def get_active_path(self) -> list[Tuple[float, float]]:
         """
@@ -47,9 +54,12 @@ class PlannerVM:
         - иначе обычный маршрут.
         """
         if deps.rtl_path:
+            setattr(deps, "active_path_kind", "mission")
             return deps.rtl_path
         if deps.debug_target and deps.debug_orbit_path:
+            setattr(deps, "active_path_kind", "maneuver")
             return deps.debug_orbit_path
+        setattr(deps, "active_path_kind", self.get_path_kind())
         return self.get_path()
 
     # ------------------------------------------------------------------ #
@@ -128,7 +138,7 @@ class PlannerVM:
 
         deps.debug_orbit_path = [(wp.lat, wp.lon) for wp in maneuver.waypoints]
         if deps.debug_orbit_path:
-            self.save_plan(deps.debug_orbit_path)
+            self.save_plan(deps.debug_orbit_path, path_kind="maneuver")
         self._persist_orbit_preview(deps.debug_orbit_path)
 
     def rebuild_route_from_current_geom(self, geom_wkt: str | None = None) -> None:

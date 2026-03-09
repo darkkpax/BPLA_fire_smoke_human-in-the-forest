@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import queue
 import time
+from datetime import datetime
 from typing import Final
 
 import numpy as np
@@ -22,6 +23,7 @@ from fire_uav.services.metrics import detect_latency, fps_gauge, queue_size
 LOG: Final = logging.getLogger("detect")
 
 Frame = NDArray[np.uint8]
+FrameItem = Frame | dict[str, object]
 _SLEEP = 0.05
 _STAT_EVERY = 1.0  # seconds
 
@@ -31,7 +33,7 @@ class DetectThread(ManagedComponent):
 
     def __init__(
         self,
-        in_q: queue.Queue[Frame | None],
+        in_q: queue.Queue[FrameItem | None],
         out_q: queue.Queue[DetectionsBatch],
     ) -> None:
         super().__init__(name="DetectThread")
@@ -58,11 +60,25 @@ class DetectThread(ManagedComponent):
         LOG.info("Detector thread started")
         while self.state is State.RUNNING:
             try:
-                frame = self._in_q.get(timeout=_SLEEP)
+                frame_item = self._in_q.get(timeout=_SLEEP)
             except queue.Empty:
-                frame = None
+                frame_item = None
 
-            if frame is None:
+            if frame_item is None:
+                continue
+
+            frame = frame_item
+            camera_id = "cam0"
+            captured_at: datetime | None = None
+            if isinstance(frame_item, dict):
+                frame = frame_item.get("frame")
+                raw_camera_id = frame_item.get("camera_id")
+                raw_timestamp = frame_item.get("timestamp")
+                if isinstance(raw_camera_id, str) and raw_camera_id.strip():
+                    camera_id = raw_camera_id.strip()
+                if isinstance(raw_timestamp, datetime):
+                    captured_at = raw_timestamp
+            if frame is None or not isinstance(frame, np.ndarray):
                 continue
 
             # track queue depth
@@ -85,7 +101,12 @@ class DetectThread(ManagedComponent):
                 if hasattr(self._engine, "detect"):
                     batch = self._engine.detect(frame)
                 else:
-                    batch = self._engine.infer(frame, return_batch=True)
+                    batch = self._engine.infer(frame, camera_id=camera_id, return_batch=True)
+            if captured_at is not None and hasattr(batch, "frame"):
+                try:
+                    batch.frame.timestamp = captured_at
+                except Exception:
+                    pass
 
             deps.last_detection = batch
             dets = getattr(batch, "detections", [])
@@ -104,7 +125,7 @@ class DetectThread(ManagedComponent):
                         getattr(dets[0], "x2"),
                         getattr(dets[0], "y2"),
                     )
-                LOG.info(
+                LOG.debug(
                     "Detections: count=%d best=%.2f bbox=%s",
                     count,
                     best,
@@ -121,7 +142,7 @@ class DetectThread(ManagedComponent):
             # periodic debug
             now = time.perf_counter()
             if now - self._stat_ts >= _STAT_EVERY:
-                LOG.info(
+                LOG.debug(
                     "Detector heartbeat: frames_q=%d dets_q=%d last_batch=%d best=%.2f",
                     self._in_q.qsize(),
                     self._out_q.qsize(),

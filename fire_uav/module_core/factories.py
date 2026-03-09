@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from fire_uav.domain.video.camera import CameraParams
 from fire_uav.module_core.energy.python_energy_model import PythonEnergyModel
 from fire_uav.module_core.fusion.python_projector import PythonGeoProjector
 from fire_uav.module_core.interfaces.energy import IEnergyModel
@@ -13,7 +14,16 @@ from fire_uav.module_core.native.geo import NativeGeoProjector
 log = logging.getLogger(__name__)
 
 
-def get_geo_projector(settings) -> IGeoProjector:  # noqa: ANN001
+def build_camera_params(settings) -> CameraParams:  # noqa: ANN001
+    return CameraParams(
+        fov_deg=float(getattr(settings, "camera_fov_deg", 82.1) or 82.1),
+        mount_pitch_deg=float(getattr(settings, "camera_mount_pitch_deg", 90.0) or 90.0),
+        mount_yaw_deg=float(getattr(settings, "camera_mount_yaw_deg", 0.0) or 0.0),
+        mount_roll_deg=float(getattr(settings, "camera_mount_roll_deg", 0.0) or 0.0),
+    )
+
+
+def get_geo_projector(settings, camera: CameraParams | None = None) -> IGeoProjector:  # noqa: ANN001
     if getattr(settings, "use_native_core", False) and NATIVE_AVAILABLE:
         log.info("Native core enabled for geo.")
         return NativeGeoProjector()
@@ -21,7 +31,7 @@ def get_geo_projector(settings) -> IGeoProjector:  # noqa: ANN001
         log.warning("Native core requested but unavailable, falling back to PythonGeoProjector.")
     else:
         log.info("Using PythonGeoProjector (native disabled).")
-    return PythonGeoProjector()
+    return PythonGeoProjector(camera=camera or build_camera_params(settings))
 
 
 def get_energy_model(settings) -> IEnergyModel:  # noqa: ANN001
@@ -43,4 +53,4 @@ def get_energy_model(settings) -> IEnergyModel:  # noqa: ANN001
     )
 
 
-__all__ = ["get_geo_projector", "get_energy_model"]
+__all__ = ["build_camera_params", "get_geo_projector", "get_energy_model"]

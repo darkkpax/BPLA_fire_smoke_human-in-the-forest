@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 from fire_uav.module_core.interfaces.geo import IGeoProjector
 from fire_uav.module_core.native import NATIVE_AVAILABLE, _native_core
@@ -25,7 +25,7 @@ if NATIVE_AVAILABLE:
             bbox: tuple[float, float, float, float],
             image_width: int,
             image_height: int,
-        ) -> tuple[float, float]:
+        ) -> Optional[tuple[float, float]]:
             x_min, y_min, x_max, y_max = bbox
             # Placeholder intrinsics; refine once camera calibration is exposed.
             fx = fy = 1.0
@@ -64,7 +64,7 @@ else:
             bbox: tuple[float, float, float, float],
             image_width: int,
             image_height: int,
-        ) -> Tuple[float, float]:
+        ) -> Optional[Tuple[float, float]]:
             raise RuntimeError("Native core is not available.")
 
 

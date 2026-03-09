@@ -43,8 +43,6 @@ def build_orbit(
         dy = radius_m * math.sin(angle)
         lat, lon = offset_latlon(target_lat, target_lon, dx, dy)
         result.append(Waypoint(lat=lat, lon=lon, alt=altitude_m))
-    # ensure we end near entry point
-    result.append(Waypoint(lat=target_lat, lon=target_lon, alt=altitude_m))
     return result
 
 
@@ -59,13 +57,12 @@ def _build_orbit_arc(
     steps = max(3, int(points_per_circle * max(0.1, total_angle_deg / 360.0)))
     total_angle_rad = math.radians(max(0.0, total_angle_deg))
     result: List[Waypoint] = []
-    for i in range(steps):
+    for i in range(steps + 1):
         angle = total_angle_rad * (i / steps)
         dx = radius_m * math.cos(angle)
         dy = radius_m * math.sin(angle)
         lat, lon = offset_latlon(target_lat, target_lon, dx, dy)
         result.append(Waypoint(lat=lat, lon=lon, alt=altitude_m))
-    result.append(Waypoint(lat=target_lat, lon=target_lon, alt=altitude_m))
     return result
 
 
@@ -83,16 +80,19 @@ def _resolve_base_location(
             except (TypeError, ValueError):
                 pass
 
+    if base_route.waypoints:
+        wp = base_route.waypoints[0]
+        return WorldCoord(lat=wp.lat, lon=wp.lon)
+
+    if math.isfinite(float(current_state.lat)) and math.isfinite(float(current_state.lon)):
+        return WorldCoord(lat=current_state.lat, lon=current_state.lon)
+
     center = getattr(settings, "map_center", None)
     if isinstance(center, (list, tuple)) and len(center) >= 2:
         try:
             return WorldCoord(lat=float(center[0]), lon=float(center[1]))
         except (TypeError, ValueError):
             pass
-
-    if base_route.waypoints:
-        wp = base_route.waypoints[0]
-        return WorldCoord(lat=wp.lat, lon=wp.lon)
 
     return WorldCoord(lat=current_state.lat, lon=current_state.lon)
 
@@ -108,16 +108,20 @@ def build_rejoin(exit_wp: Waypoint, base_route: Route) -> List[Waypoint]:
     if not base_route.waypoints:
         return []
 
-    closest_idx = 0
+    start_idx = 0
+    if base_route.active_index is not None:
+        start_idx = max(0, min(int(base_route.active_index), len(base_route.waypoints) - 1))
+
+    closest_idx = start_idx
     closest_dist = float("inf")
-    for idx, wp in enumerate(base_route.waypoints):
+    for idx in range(start_idx, len(base_route.waypoints)):
+        wp = base_route.waypoints[idx]
         dist = haversine_m((exit_wp.lat, exit_wp.lon), (wp.lat, wp.lon))
         if dist < closest_dist:
             closest_dist = dist
             closest_idx = idx
 
-    path = [exit_wp]
-    path.extend(base_route.waypoints[closest_idx:])
+    path = list(base_route.waypoints[closest_idx:])
     return path
 
 
@@ -131,7 +135,19 @@ def build_energy_aware_orbit(
     energy_model: IEnergyModel,
     orbit_params: OrbitParams,
 ) -> Route | None:
-    entry_wp = Waypoint(lat=target_lat, lon=target_lon, alt=orbit_params.altitude_m)
+    preview_orbit = _build_orbit_arc(
+        target_lat,
+        target_lon,
+        orbit_params.radius_m,
+        orbit_params.altitude_m,
+        orbit_params.points_per_circle,
+        360.0 * max(1, orbit_params.loops),
+    )
+    entry_wp = preview_orbit[0] if preview_orbit else Waypoint(
+        lat=target_lat,
+        lon=target_lon,
+        alt=orbit_params.altitude_m,
+    )
     approach = build_approach(current_state, entry_wp)
 
     def _assemble_route(orbit: List[Waypoint]) -> Route:
@@ -185,20 +201,6 @@ def build_energy_aware_orbit(
             log.warning("EnergyModel: reduced orbit to %.0f deg to fit remaining battery.", angle)
             return candidate
 
-    return_wp = Waypoint(
-        lat=base_location.lat,
-        lon=base_location.lon,
-        alt=orbit_params.altitude_m,
-    )
-    minimal_route = Route(
-        version=base_route.version if base_route.version is not None else 1,
-        waypoints=approach + [return_wp],
-        active_index=0 if approach else None,
-    )
-    if _is_feasible(minimal_route):
-        log.warning("EnergyModel: skipping orbit; returning to base instead.")
-        return minimal_route
-
     log.warning("EnergyModel: insufficient battery for orbit maneuver.")
     return None
 
@@ -211,10 +213,25 @@ def build_maneuver(
     energy_model: IEnergyModel,
     settings,
 ) -> Route | None:
-    altitude = getattr(settings, "maneuver_alt_m", current_state.alt)
-    radius = getattr(settings, "orbit_radius_m", 50.0)
-    points_per_circle = getattr(settings, "orbit_points_per_circle", 12)
-    loops = getattr(settings, "orbit_loops", 1)
+    raw_altitude = getattr(settings, "maneuver_alt_m", None)
+    try:
+        altitude = float(raw_altitude) if raw_altitude is not None else float(current_state.alt)
+    except (TypeError, ValueError):
+        altitude = float(current_state.alt)
+    altitude = max(0.0, altitude)
+
+    try:
+        radius = max(1.0, float(getattr(settings, "orbit_radius_m", 50.0) or 50.0))
+    except (TypeError, ValueError):
+        radius = 50.0
+    try:
+        points_per_circle = max(3, int(getattr(settings, "orbit_points_per_circle", 12) or 12))
+    except (TypeError, ValueError):
+        points_per_circle = 12
+    try:
+        loops = max(1, int(getattr(settings, "orbit_loops", 1) or 1))
+    except (TypeError, ValueError):
+        loops = 1
     orbit_params = OrbitParams(
         radius_m=radius,
         altitude_m=altitude,

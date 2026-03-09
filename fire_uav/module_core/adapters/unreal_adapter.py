@@ -84,8 +84,10 @@ class UnrealSimUavAdapter(IUavAdapter):
             try:
                 resp = await self._client.get(url)
                 resp.raise_for_status()
-                msg = TelemetryMessage(**resp.json())
-                battery_fraction, battery_percent = _normalize_battery(msg.battery)
+                data = resp.json()
+                if data.get("yaw") is None:
+                    data["yaw"] = 0.0
+                msg = TelemetryMessage(**data)
                 sample = telemetry_sample_from_message(msg)
                 if self._telemetry_callback is not None:
                     await self._telemetry_callback.on_telemetry(sample)
