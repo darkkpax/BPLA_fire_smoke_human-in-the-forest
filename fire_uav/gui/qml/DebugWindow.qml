@@ -46,7 +46,7 @@ Window {
     Component.onCompleted: batteryProfileBox.currentIndex = batteryProfileIndex()
 
     Shortcut {
-        sequence: StandardKey.Close
+        sequences: [StandardKey.Close]
         onActivated: debugWindow.visible = false
     }
 
@@ -326,6 +326,20 @@ Window {
                                 item.enabled = Qt.binding(function() { return hasApp && app.currentBackend === "unreal" })
                                 item.toggleAction = function() {
                                     if (hasApp) app.setUnrealVideoMode(app.unrealVideoMode === "h264_stream" ? "jpeg_snapshots" : "h264_stream")
+                                }
+                            }
+                        }
+
+                        Loader {
+                            Layout.fillWidth: true
+                            sourceComponent: toggleRow
+                            onLoaded: {
+                                item.title = Qt.binding(function() { return hasApp && app.debugDisableDetectorDuringOrbit ? "Detector hard stop during orbit" : "Detector keeps running during orbit" })
+                                item.subtitle = "Debug only. Hard-disables detector processing while orbit is active."
+                                item.checked = Qt.binding(function() { return hasApp && app.debugDisableDetectorDuringOrbit })
+                                item.enabled = Qt.binding(function() { return hasApp })
+                                item.toggleAction = function() {
+                                    if (hasApp) app.setDebugDisableDetectorDuringOrbit(!app.debugDisableDetectorDuringOrbit)
                                 }
                             }
                         }

@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import List, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
+from fire_uav.utils.time import utc_now
 
 
 class WorldCoord(BaseModel):
@@ -47,7 +48,7 @@ class TelemetrySample(BaseModel):
     camera_mount_pitch_deg: float | None = None
     camera_mount_yaw_deg: float | None = None
     camera_mount_roll_deg: float | None = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
     source: str | None = Field(
         default=None,
         description="Optional identifier of the telemetry source (autopilot channel, etc.)",
@@ -98,7 +99,7 @@ class GeoDetection(BaseModel):
     lat: float
     lon: float
     alt: float | None = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow, alias="captured_at")
+    timestamp: datetime = Field(default_factory=utc_now, alias="captured_at")
     frame_id: str | None = Field(default=None, alias="source_frame")
     track_id: int | None = None
 
@@ -116,7 +117,7 @@ class GeoDetection(BaseModel):
 
 
 class Detection(BaseModel):
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
     camera_id: str
     class_id: int
     confidence: float
@@ -126,7 +127,7 @@ class Detection(BaseModel):
 
 
 class FrameMeta(BaseModel):
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
     camera_id: str
     width: int
     height: int

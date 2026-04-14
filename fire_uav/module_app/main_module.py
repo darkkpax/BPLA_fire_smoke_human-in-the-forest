@@ -19,12 +19,14 @@ from fire_uav.module_core.drivers.registry import create_driver
 from fire_uav.module_core.detections import DetectionAggregator, DetectionPipeline
 from fire_uav.module_core.factories import get_energy_model, get_geo_projector
 from fire_uav.module_core.interfaces.energy import IEnergyModel
+from fire_uav.module_core.route.base_location import resolve_base_location
 from fire_uav.module_core.route.python_planner import PythonRoutePlanner
 from fire_uav.module_core.schema import Route, TelemetrySample, Waypoint
 from fire_uav.services.bus import Event, bus
 from fire_uav.services.visualizer_adapter import VisualizerAdapter
 from fire_uav.services.telemetry.transmitter import Transmitter
 from fire_uav.services.telemetry_ingest import TelemetryIngestContext, ingest_telemetry
+from fire_uav.utils.time import utc_now
 
 log = logging.getLogger(__name__)
 _health_server: uvicorn.Server | None = None
@@ -59,22 +61,10 @@ class _ModuleTelemetryConsumer(IUavTelemetryConsumer):
         )
 
     def _resolve_base_location(self, sample: TelemetrySample) -> tuple[float, float]:
-        for lat_key, lon_key in (("home_lat", "home_lon"), ("base_lat", "base_lon")):
-            lat = getattr(self.settings, lat_key, None)
-            lon = getattr(self.settings, lon_key, None)
-            if lat is not None and lon is not None:
-                try:
-                    return float(lat), float(lon)
-                except (TypeError, ValueError):
-                    pass
-
-        center = getattr(self.settings, "map_center", None)
-        if isinstance(center, (list, tuple)) and len(center) >= 2:
-            try:
-                return float(center[0]), float(center[1])
-            except (TypeError, ValueError):
-                pass
-
+        route = Route(version=1, waypoints=[], active_index=None)
+        resolved = resolve_base_location(self.settings, route, sample)
+        if resolved is not None:
+            return resolved.lat, resolved.lon
         if not self._base_warned:
             log.warning("Base location unavailable; falling back to current telemetry position.")
             self._base_warned = True
@@ -157,7 +147,7 @@ async def _watchdog_loop(cfg) -> None:
     detection_flagged = False
     while True:
         await asyncio.sleep(cfg.watchdog_interval_sec)
-        now = datetime.utcnow()
+        now = utc_now()
         last_tel = health_state.last_telemetry
         if last_tel is None or (now - last_tel).total_seconds() > cfg.no_telemetry_timeout_sec:
             if not telemetry_flagged:

@@ -28,6 +28,7 @@ from fire_uav.services.mission.camera_monitor import CameraMonitor
 from fire_uav.services.mission.link_monitor import LinkMonitor
 from fire_uav.services.mission.state import MissionState
 from fire_uav.services.telemetry_ingest import TelemetryIngestContext, ingest_telemetry
+from fire_uav.utils.time import utc_now
 
 app = FastAPI(
     title="Skysight sim API",
@@ -100,10 +101,10 @@ def _build_route(uav_id: str, path: List[tuple[float, float]], mode: str) -> Rou
     waypoints = [WaypointV1(lat=lat, lon=lon, alt=alt) for lat, lon in path]
     route = RouteV1(
         uav_id=uav_id,
-        route_id=f"{uav_id}:{mode.lower()}:{int(datetime.utcnow().timestamp())}",
+        route_id=f"{uav_id}:{mode.lower()}:{int(utc_now().timestamp())}",
         waypoints=waypoints,
         mode=mode,
-        created_at=datetime.utcnow(),
+        created_at=utc_now(),
     )
     return route
 
@@ -143,7 +144,7 @@ async def handshake(req: HandshakeRequestV1) -> HandshakeResponseV1:
     }
     return HandshakeResponseV1(
         ok=True,
-        server_time=datetime.utcnow(),
+        server_time=utc_now(),
         required_fields=required,
         assigned_uav_id=req.uav_id,
         notes="contract_v1",
@@ -210,7 +211,7 @@ def get_health(uav_id: str) -> HealthV1:
         message = "telemetry_missing"
     return HealthV1(
         uav_id=uav_id,
-        timestamp=datetime.utcnow(),
+        timestamp=utc_now(),
         link_status=link_status,
         camera_status=camera_status,
         battery_percent=battery,

@@ -51,6 +51,15 @@ class DetectThread(ManagedComponent):
             self._disabled_reason = str(exc)
         self._stat_ts = time.perf_counter()
         self._last_frame_ts = time.perf_counter()
+        self._paused = False
+        bus.subscribe(Event.DETECTOR_START, lambda *_: self.resume_processing())
+        bus.subscribe(Event.DETECTOR_STOP, lambda *_: self.pause_processing())
+
+    def pause_processing(self) -> None:
+        self._paused = True
+
+    def resume_processing(self) -> None:
+        self._paused = False
 
     def loop(self) -> None:
         if self._engine is None:
@@ -65,6 +74,8 @@ class DetectThread(ManagedComponent):
                 frame_item = None
 
             if frame_item is None:
+                continue
+            if self._paused:
                 continue
 
             frame = frame_item

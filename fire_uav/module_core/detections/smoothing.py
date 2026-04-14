@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, TYPE_CHECKING
+from fire_uav.utils.time import utc_now
 
 if TYPE_CHECKING:
     from fire_uav.module_core.detections.pipeline import RawDetectionPayload
@@ -85,7 +86,7 @@ class BBoxSmoother:
 
     @staticmethod
     def _ts(det: "RawDetectionPayload") -> datetime:
-        return getattr(det, "timestamp", None) or datetime.utcnow()
+        return getattr(det, "timestamp", None) or utc_now()
 
     # ------------------------------------------------------------------ #
     def _smooth_bbox(
@@ -137,7 +138,7 @@ class BBoxSmoother:
         self, detections: List["RawDetectionPayload"]
     ) -> List[tuple["RawDetectionPayload", tuple[float, float, float, float], int]]:
         if not detections:
-            self._prune_stale(datetime.utcnow())
+            self._prune_stale(utc_now())
             return []
 
         now = max(self._ts(det) for det in detections)
@@ -222,7 +223,7 @@ class NativeBBoxSmoother:
         dt = getattr(det, "timestamp", None)
         if dt:
             return dt.timestamp()
-        return datetime.utcnow().timestamp()
+        return utc_now().timestamp()
 
     def assign_and_smooth(
         self, detections: List["RawDetectionPayload"]

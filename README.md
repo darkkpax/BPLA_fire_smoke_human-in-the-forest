@@ -9,6 +9,12 @@ pip install -e ".[module,detect]"
 python -m fire_uav.module_app.main_module
 ```
 
+## PyAV install note
+```bash
+python -m pip install av==15.1.0
+```
+For H264/Unreal streaming support, install `av`, not `pyav`. The PyPI package name is `av`, so `pip install pyav` will fail with `No matching distribution found`.
+
 ## Environment check
 ```bash
 python -m fire_uav.tools.env_check --profile module

@@ -4,6 +4,7 @@ annotated-types==0.7.0
 anyio==4.9.0
 astunparse==1.6.3
 attrs==25.3.0
+av==15.1.0
 autopep8==2.3.2
 backports.tarfile==1.2.0
 black==25.1.0
@@ -34,7 +35,6 @@ fastapi-cli==0.0.7
 fastjsonschema==2.21.1
 filelock==3.18.0
 findpython==0.6.3
--e git+https://github.com/worldkpax/BPLA_fire_smoke_human-in-the-forest.git@61bdb1dd695b443e259e3d789922bf6cda12dfe7#egg=fire_uav
 flake8==7.3.0
 flake8-bugbear==24.12.12
 flatbuffers==24.3.25

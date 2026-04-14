@@ -37,6 +37,7 @@ class DetectorVM(QObject):
         self._win = getattr(settings, "agg_window", 5)
         self._votes = getattr(settings, "agg_votes_required", 3)
         self._min_conf = getattr(settings, "agg_min_confidence", 0.6)
+        self._smooth_alpha = float(getattr(settings, "bbox_smooth_alpha", 0.5) or 0.5)
         self._last_stable_conf: float = 0.0
         self._last_stable_count: int = 0
         # mypy ����>�?��'�?�? �?�� �?��?�?�?�����?��?��� �'����� ��?�>�+�?��� �?" ���?�?���?�>�?��?
@@ -47,11 +48,19 @@ class DetectorVM(QObject):
         """�-�����?�?�'��'�? �?��'���'�?�? (���?�?��>�?�ؐ�'�? EventBus, �� �'.��.)."""
         bus.emit(Event.APP_START)
         _log.debug("APP_START emitted")
+        bus.emit(Event.DETECTOR_START)
+        _log.debug("DETECTOR_START emitted")
 
     def stop(self) -> None:
         """�?�?�'���?�?�?��'�? �?��'���'�?�?."""
-        bus.emit(Event.APP_STOP)
-        _log.debug("APP_STOP emitted")
+        bus.emit(Event.DETECTOR_STOP)
+        _log.debug("DETECTOR_STOP emitted")
+
+    def reset(self) -> None:
+        self._tracks.clear()
+        self._last_stable_conf = 0.0
+        self._last_stable_count = 0
+        self.bboxes.emit([])
 
     def set_conf(self, value: float) -> None:
         """Update detection confidence threshold (broadcast via EventBus)."""
@@ -134,7 +143,7 @@ class DetectorVM(QObject):
                 continue
 
             track = self._tracks[match_idx]
-            alpha = 0.7
+            alpha = max(0.0, min(0.95, self._smooth_alpha))
             px1, py1, px2, py2 = track["bbox"]
             x1, y1, x2, y2 = bbox
             track["bbox"] = (

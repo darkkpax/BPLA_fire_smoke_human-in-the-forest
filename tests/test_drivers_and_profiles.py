@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
+import importlib
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
-from fire_uav.config import settings as settings_module
 from fire_uav.module_core.adapters import (
     CustomSdkUavAdapter,
     MavlinkUavAdapter,
@@ -12,6 +14,8 @@ from fire_uav.module_core.adapters import (
     UnrealSimUavAdapter,
 )
 from fire_uav.module_core.drivers.registry import create_driver, resolve_driver_type
+
+settings_module = importlib.import_module("fire_uav.config.settings")
 
 
 def _make_cfg(**overrides) -> SimpleNamespace:
@@ -98,3 +102,36 @@ def test_load_settings_applies_jetson_profile(monkeypatch: pytest.MonkeyPatch) -
     assert settings.use_native_core is True
     assert settings.visualizer_enabled is False
     assert settings.log_level == "INFO"
+
+
+def test_settings_defaults_match_settings_default_json() -> None:
+    raw = json.loads(Path("fire_uav/config/settings_default.json").read_text(encoding="utf-8"))
+    defaults = settings_module.Settings()
+
+    expected = {
+        "unreal_video_mode": "h264_stream",
+        "unreal_video_target_fps": 60.0,
+        "unreal_camera_hz": 60.0,
+        "unreal_telemetry_hz": 60.0,
+        "visualizer_enabled": True,
+        "log_level": "WARNING",
+        "map_center": [56.02, 92.9],
+        "home_lat": None,
+        "home_lon": None,
+        "base_lat": None,
+        "base_lon": None,
+        "cruise_speed_mps": 12.0,
+        "power_cruise_w": 45.0,
+        "battery_wh": 77.0,
+        "max_flight_distance_m": 0.0,
+        "yolo_model": "data/models/best_yolo11.pt",
+        "yolo_conf": 0.15,
+        "yolo_classes": [0, 1],
+        "agg_window": 3,
+        "agg_votes_required": 1,
+        "agg_min_confidence": 0.4,
+    }
+
+    for key, value in expected.items():
+        assert raw[key] == value
+        assert getattr(defaults, key) == value

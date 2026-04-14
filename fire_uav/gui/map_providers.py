@@ -2,20 +2,38 @@
 from __future__ import annotations
 
 import base64
+import importlib
 import json
 import logging
 import tempfile
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-import folium
-from folium.plugins import Draw
 import fire_uav.infrastructure.providers as deps
 from fire_uav.config import settings
 from fire_uav.core.protocol import MapBounds
 from fire_uav.module_core.geometry import haversine_m, interpolate_path_point
+from fire_uav.module_core.route.base_location import resolve_base_location
+from fire_uav.module_core.schema import Route, TelemetrySample, Waypoint
 
 log = logging.getLogger(__name__)
+
+_folium_module = None
+_folium_draw_cls = None
+
+
+def _get_folium():
+    global _folium_module
+    if _folium_module is None:
+        _folium_module = importlib.import_module("folium")
+    return _folium_module
+
+
+def _get_folium_draw():
+    global _folium_draw_cls
+    if _folium_draw_cls is None:
+        _folium_draw_cls = importlib.import_module("folium.plugins").Draw
+    return _folium_draw_cls
 
 
 def _spawn_debug_visuals_enabled() -> bool:
@@ -346,6 +364,8 @@ class FoliumMapProvider:
     def render_map(
         self, path: list[tuple[float, float]], token: int, path_kind: str | None = None
     ) -> Path:
+        folium = _get_folium()
+        draw_cls = _get_folium_draw()
         center = path[0] if path else (56.02, 92.9)
         tiles_url, attr = self._tile_layer()
         telemetry = getattr(deps, "latest_telemetry", None)
@@ -385,7 +405,7 @@ class FoliumMapProvider:
             control=False,
         ).add_to(fmap)
 
-        Draw(
+        draw_cls(
             export=False,
             draw_options={
                 "polyline": {"shapeOptions": {"color": "#000000"}},
@@ -506,6 +526,54 @@ class FoliumMapProvider:
                 locations=[(lat, lon) for lat, lon in deps.debug_orbit_path],
                 color="orange",
                 weight=2,
+            ).add_to(fmap)
+
+        preview_paths = getattr(deps, "debug_orbit_preview_paths", []) or []
+        for raw_path in preview_paths:
+            coords = []
+            for lat, lon in raw_path or []:
+                try:
+                    coords.append((float(lat), float(lon)))
+                except (TypeError, ValueError):
+                    continue
+            if len(coords) < 2:
+                continue
+            folium.PolyLine(
+                locations=coords,
+                color="#7bc6ff",
+                weight=2,
+                dash_array="12 8",
+                opacity=0.9,
+            ).add_to(fmap)
+
+        for lat, lon in (getattr(deps, "debug_orbit_targets", []) or []):
+            try:
+                center = (float(lat), float(lon))
+            except (TypeError, ValueError):
+                continue
+            folium.Circle(
+                location=center,
+                radius=float(getattr(settings, "orbit_radius_m", 50.0) or 50.0),
+                color="#7bc6ff",
+                weight=2,
+                fill=True,
+                fill_opacity=0.06,
+                dash_array="10 8",
+            ).add_to(fmap)
+
+        sequence_coords = []
+        for lat, lon in (getattr(deps, "debug_orbit_sequence", []) or []):
+            try:
+                sequence_coords.append((float(lat), float(lon)))
+            except (TypeError, ValueError):
+                continue
+        if len(sequence_coords) >= 2:
+            folium.PolyLine(
+                locations=sequence_coords,
+                color="#ffd666",
+                weight=3,
+                dash_array="8 10",
+                opacity=0.8,
             ).add_to(fmap)
 
         fmap.get_root().header.add_child(
@@ -632,27 +700,33 @@ class OpenLayersMapProvider:
                 base_lonlat = None
 
         if base_lonlat is None:
-            for lat_key, lon_key in (("home_lat", "home_lon"), ("base_lat", "base_lon")):
-                lat = getattr(settings, lat_key, None)
-                lon = getattr(settings, lon_key, None)
-                if lat is not None and lon is not None:
-                    try:
-                        base_lonlat = [float(lon), float(lat)]
-                        break
-                    except (TypeError, ValueError):
-                        continue
-
-        if base_lonlat is None:
-            center = getattr(settings, "map_center", None)
-            if isinstance(center, (list, tuple)) and len(center) >= 2:
+            route = Route(
+                version=1,
+                waypoints=[Waypoint(lat=lat, lon=lon, alt=0.0) for lat, lon in path],
+                active_index=0 if path else None,
+            )
+            telemetry_sample = None
+            if telemetry is not None and hasattr(telemetry, "lat") and hasattr(telemetry, "lon"):
                 try:
-                    base_lonlat = [float(center[1]), float(center[0])]
-                except (TypeError, ValueError):
-                    base_lonlat = None
-
-        if base_lonlat is None and path:
-            lat, lon = path[0]
-            base_lonlat = [float(lon), float(lat)]
+                    payload = {
+                        "lat": float(telemetry.lat),
+                        "lon": float(telemetry.lon),
+                        "alt": float(getattr(telemetry, "alt", 0.0) or 0.0),
+                        "yaw": float(getattr(telemetry, "yaw", 0.0) or 0.0),
+                        "pitch": float(getattr(telemetry, "pitch", 0.0) or 0.0),
+                        "roll": float(getattr(telemetry, "roll", 0.0) or 0.0),
+                        "battery": float(getattr(telemetry, "battery", 1.0) or 1.0),
+                        "battery_percent": getattr(telemetry, "battery_percent", None),
+                    }
+                    timestamp = getattr(telemetry, "timestamp", None)
+                    if timestamp is not None:
+                        payload["timestamp"] = timestamp
+                    telemetry_sample = TelemetrySample(**payload)
+                except Exception:
+                    telemetry_sample = None
+            resolved = resolve_base_location(settings, route, telemetry_sample)
+            if resolved is not None:
+                base_lonlat = [float(resolved.lon), float(resolved.lat)]
 
         return {
             "max_distance_m": max_distance_m,
@@ -664,6 +738,9 @@ class OpenLayersMapProvider:
     def render_map(
         self, path: list[tuple[float, float]], token: int, path_kind: str | None = None
     ) -> Path:
+        preview_path = getattr(deps, "route_edit_preview_path", None)
+        if isinstance(preview_path, list):
+            path = [(float(lat), float(lon)) for lat, lon in preview_path]
         center = path[0] if path else (56.02, 92.9)
         tiles_url, attr = self._tile_layer()
         css_url, js_url = self._asset_urls()
@@ -735,6 +812,28 @@ class OpenLayersMapProvider:
             debug_orbit_coords = [
                 [lon, lat] for lat, lon in (getattr(deps, "debug_orbit_path", []) or [])
             ]
+        orbit_targets = []
+        for lat, lon in (getattr(deps, "debug_orbit_targets", []) or []):
+            try:
+                orbit_targets.append([float(lon), float(lat)])
+            except (TypeError, ValueError):
+                continue
+        orbit_sequence = []
+        for lat, lon in (getattr(deps, "debug_orbit_sequence", []) or []):
+            try:
+                orbit_sequence.append([float(lon), float(lat)])
+            except (TypeError, ValueError):
+                continue
+        orbit_preview_paths = []
+        for raw_path in (getattr(deps, "debug_orbit_preview_paths", []) or []):
+            coords = []
+            for lat, lon in raw_path or []:
+                try:
+                    coords.append([float(lon), float(lat)])
+                except (TypeError, ValueError):
+                    continue
+            if len(coords) >= 2:
+                orbit_preview_paths.append(coords)
         target = None
         if _spawn_debug_visuals_enabled() and deps.debug_target:
             lat = deps.debug_target.get("lat")
@@ -752,6 +851,7 @@ class OpenLayersMapProvider:
             objects.append(
                 {
                     "object_id": str(obj.get("object_id", "")),
+                    "display_index": int(obj.get("display_index", obj.get("object_index", 0)) or 0),
                     "lat": lat,
                     "lon": lon,
                     "selected": bool(obj.get("selected", False)),
@@ -768,6 +868,22 @@ class OpenLayersMapProvider:
                     home_coord = [float(lon), float(lat)]
                 except (TypeError, ValueError):
                     home_coord = None
+        route_edit_anchor = None
+        anchor_data = getattr(deps, "route_edit_anchor", None)
+        if isinstance(anchor_data, dict):
+            lat = anchor_data.get("lat")
+            lon = anchor_data.get("lon")
+            if lat is not None and lon is not None:
+                try:
+                    route_edit_anchor = [float(lon), float(lat)]
+                except (TypeError, ValueError):
+                    route_edit_anchor = None
+        route_edit_locked = []
+        for lat, lon in (getattr(deps, "route_edit_locked_path", None) or []):
+            try:
+                route_edit_locked.append([float(lon), float(lat)])
+            except (TypeError, ValueError):
+                continue
 
         uav_id = None
         source = getattr(telemetry, "source", None) if telemetry is not None else None
@@ -790,6 +906,12 @@ class OpenLayersMapProvider:
             "path_done": path_done,
             "path_remaining": path_remaining,
             "debug_orbit": debug_orbit_coords,
+            "orbit_targets": orbit_targets,
+            "orbit_sequence": orbit_sequence,
+            "orbit_preview_paths": orbit_preview_paths,
+            "orbit_radius_m": float(getattr(settings, "orbit_radius_m", 50.0) or 50.0),
+            "route_edit_anchor": route_edit_anchor,
+            "route_edit_locked": route_edit_locked,
             "drone": [float(drone_pos[1]), float(drone_pos[0])] if (drone_pos and show_drone) else None,
             "uav_id": uav_id,
             "heading": heading,
@@ -827,14 +949,14 @@ class OpenLayersMapProvider:
       padding: 0;
       width: 100%;
       height: 100%;
-      background: transparent;
+      background: #000000;
     }}
     #map {{
       width: 100%;
       height: 100%;
       border-radius: {payload["radius_px"]}px;
       overflow: hidden;
-      background: #121826;
+      background: #000000;
     }}
     .ol-control, .ol-zoom, .ol-rotate, .ol-attribution {{
       display: none !important;
@@ -894,6 +1016,9 @@ class OpenLayersMapProvider:
       path: new ol.style.Style({{
         stroke: new ol.style.Stroke({{ color: '#000000', width: 3 }})
       }}),
+      lockedPath: new ol.style.Style({{
+        stroke: new ol.style.Stroke({{ color: 'rgba(0,0,0,0.28)', width: 3, lineDash: [8, 8] }})
+      }}),
       pathDone: new ol.style.Style({{
         stroke: new ol.style.Stroke({{ color: 'rgba(255,255,255,0.35)', width: 4 }})
       }}),
@@ -940,18 +1065,39 @@ class OpenLayersMapProvider:
           stroke: new ol.style.Stroke({{ color: '#000000', width: 3 }})
         }})
       }}),
+      editAnchor: new ol.style.Style({{
+        image: new ol.style.Circle({{
+          radius: 7,
+          fill: new ol.style.Fill({{ color: '#ffffff' }}),
+          stroke: new ol.style.Stroke({{ color: '#000000', width: 3 }})
+        }})
+      }}),
       object: new ol.style.Style({{
         image: new ol.style.Circle({{
-          radius: 6,
+          radius: 11,
           fill: new ol.style.Fill({{ color: '#ffffff' }}),
           stroke: new ol.style.Stroke({{ color: '#000000', width: 2 }})
+        }}),
+        text: new ol.style.Text({{
+          text: '',
+          font: '600 11px Inter',
+          fill: new ol.style.Fill({{ color: '#000000' }}),
+          textAlign: 'center',
+          textBaseline: 'middle'
         }})
       }}),
       objectSelected: new ol.style.Style({{
         image: new ol.style.Circle({{
-          radius: 6,
+          radius: 12,
           fill: new ol.style.Fill({{ color: '#ffffff' }}),
           stroke: new ol.style.Stroke({{ color: '#000000', width: 3 }})
+        }}),
+        text: new ol.style.Text({{
+          text: '',
+          font: '700 11px Inter',
+          fill: new ol.style.Fill({{ color: '#000000' }}),
+          textAlign: 'center',
+          textBaseline: 'middle'
         }})
       }})
     }};
@@ -1089,10 +1235,45 @@ class OpenLayersMapProvider:
       }}
       if (kind === 'object') {{
         const selected = feature.get('selected');
-        if (selected === true) return styles.objectSelected;
-        if (selected === false) return styles.object;
         const objectId = feature.get('object_id') || '';
-        return objectId && objectId === data.selected_id ? styles.objectSelected : styles.object;
+        const baseStyle = (selected === true)
+          ? styles.objectSelected.clone()
+          : ((selected === false) ? styles.object.clone() : (objectId && objectId === data.selected_id ? styles.objectSelected.clone() : styles.object.clone()));
+        const label = feature.get('object_index');
+        if (baseStyle.getText()) {{
+          baseStyle.getText().setText(label ? String(label) : '');
+        }}
+        return baseStyle;
+      }}
+      if (kind === 'orbitTarget') {{
+        return new ol.style.Style({{
+          stroke: new ol.style.Stroke({{
+            color: 'rgba(123, 198, 255, 0.85)',
+            width: 2,
+            lineDash: [10, 8]
+          }}),
+          fill: new ol.style.Fill({{
+            color: 'rgba(123, 198, 255, 0.08)'
+          }})
+        }});
+      }}
+      if (kind === 'orbitSequence') {{
+        return new ol.style.Style({{
+          stroke: new ol.style.Stroke({{
+            color: 'rgba(255, 214, 102, 0.78)',
+            width: 3,
+            lineDash: [8, 10]
+          }})
+        }});
+      }}
+      if (kind === 'orbitPreview') {{
+        return new ol.style.Style({{
+          stroke: new ol.style.Stroke({{
+            color: 'rgba(123, 198, 255, 0.92)',
+            width: 2.5,
+            lineDash: [14, 8]
+          }})
+        }});
       }}
       if (kind === 'segment') {{
         return segmentStyle(feature);
@@ -1253,6 +1434,14 @@ class OpenLayersMapProvider:
       overlaySource.addFeature(feature);
     }}
 
+    function addOverlayCircle(coord, radiusM, kind, props) {{
+      if (!coord || !Number.isFinite(radiusM) || radiusM <= 0) return;
+      const center3857 = ol.proj.fromLonLat(coord);
+      const circle = new ol.geom.Circle(center3857, radiusM);
+      const feature = new ol.Feature(Object.assign({{ geometry: circle, kind }}, props || {{}}));
+      overlaySource.addFeature(feature);
+    }}
+
     function removeOverlayKinds(kinds) {{
       const toRemove = [];
       overlaySource.getFeatures().forEach(f => {{
@@ -1262,7 +1451,7 @@ class OpenLayersMapProvider:
     }}
 
     function setObjects(objects) {{
-      removeOverlayKinds(['object']);
+      removeOverlayKinds(['object', 'orbitTarget', 'orbitSequence', 'orbitPreview']);
       if (!Array.isArray(objects)) return;
       objects.forEach(obj => {{
         if (!obj) return;
@@ -1271,11 +1460,28 @@ class OpenLayersMapProvider:
         if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
         addOverlayPoint([lon, lat], 'object', {{
           object_id: obj.object_id || '',
+          object_index: Number(obj.display_index || obj.object_index || 0),
           lat,
           lon,
           selected: obj.selected === true
         }});
       }});
+      if (Array.isArray(data.orbit_targets)) {{
+        const radiusM = Number(data.orbit_radius_m || 0);
+        data.orbit_targets.forEach(coord => {{
+          if (!Array.isArray(coord) || coord.length < 2) return;
+          addOverlayCircle(coord, radiusM, 'orbitTarget');
+        }});
+      }}
+      if (Array.isArray(data.orbit_sequence) && data.orbit_sequence.length >= 2) {{
+        addOverlayLine(data.orbit_sequence, 'orbitSequence');
+      }}
+      if (Array.isArray(data.orbit_preview_paths)) {{
+        data.orbit_preview_paths.forEach(coords => {{
+          if (!Array.isArray(coords) || coords.length < 2) return;
+          addOverlayLine(coords, 'orbitPreview');
+        }});
+      }}
     }}
 
 
@@ -1289,45 +1495,15 @@ class OpenLayersMapProvider:
     function updateSegmentOverlays(coords, kind) {{
       removeOverlayKinds(['segment', 'segmentLabel']);
       if (!coords || coords.length < 2) return;
-      const showSegmentLabels = kind !== 'maneuver';
       let cumulative = 0;
-      function offsetLabelPoint(a, b, meters) {{
-        const mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
-        const midLat = mid[1] * Math.PI / 180;
-        const metersPerDegLat = 111320;
-        const metersPerDegLon = Math.max(1, 111320 * Math.cos(midLat));
-        const dxm = (b[0] - a[0]) * metersPerDegLon;
-        const dym = (b[1] - a[1]) * metersPerDegLat;
-        const len = Math.hypot(dxm, dym);
-        if (!len) return mid;
-        const nx = -dym / len;
-        const ny = dxm / len;
-        return [
-          mid[0] + (nx * meters) / metersPerDegLon,
-          mid[1] + (ny * meters) / metersPerDegLat
-        ];
-      }}
-      function segmentAngleRad(a, b) {{
-        const a3857 = ol.proj.fromLonLat(a);
-        const b3857 = ol.proj.fromLonLat(b);
-        return Math.atan2(b3857[1] - a3857[1], b3857[0] - a3857[0]);
-      }}
       for (let i = 0; i < coords.length - 1; i++) {{
         const a = coords[i];
         const b = coords[i + 1];
         const segLen = haversineM(a, b);
         const cumulativeNext = cumulative + segLen;
-        const remaining = estimateRouteRemainingPercent(cumulativeNext);
+        const remaining = estimateRemainingPercent(cumulativeNext, b);
         const displayRemaining = remaining === null ? null : clamp(remaining, 0, 100);
-        const label = displayRemaining === null ? null : `${{displayRemaining.toFixed(1)}}%`;
         addOverlayLine([a, b], 'segment', {{ remaining: displayRemaining }});
-        if (showSegmentLabels && label) {{
-          addOverlayPoint(offsetLabelPoint(a, b, 32), 'segmentLabel', {{
-            label,
-            remaining: displayRemaining,
-            angle: segmentAngleRad(a, b)
-          }});
-        }}
         cumulative = cumulativeNext;
       }}
     }}
@@ -1393,6 +1569,10 @@ class OpenLayersMapProvider:
       addOverlayPoint(data.path[0], 'start');
       addOverlayPoint(data.path[data.path.length - 1], 'finish');
     }}
+    addOverlayLine(data.route_edit_locked, 'lockedPath');
+    if (data.route_edit_anchor && data.route_edit_anchor.length >= 2) {{
+      addOverlayPoint(data.route_edit_anchor, 'editAnchor');
+    }}
     updateSegmentOverlays(data.path, pathKind);
     addOverlayLine(data.path_done, 'pathDone');
     addOverlayLine(data.path_remaining, 'pathRemaining');
@@ -1416,6 +1596,7 @@ class OpenLayersMapProvider:
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
       addOverlayPoint([lon, lat], 'object', {{
         object_id: obj.object_id || '',
+        object_index: Number(obj.display_index || obj.object_index || 0),
         lat,
         lon,
         selected: obj.selected === true
@@ -1435,9 +1616,10 @@ class OpenLayersMapProvider:
       if (line) {{
         const geom = line.getGeometry();
         const coords = lineCoordsFromFeature(line);
-        const clamped = clampPathToBattery(coords);
-        if (geom && clamped && clamped.length >= 2 && JSON.stringify(clamped) !== JSON.stringify(coords)) {{
-          geom.setCoordinates(clamped.map(c => ol.proj.fromLonLat(c)));
+        let nextCoords = clampPathToBattery(coords);
+        nextCoords = applyRouteEditAnchor(nextCoords);
+        if (geom && nextCoords && nextCoords.length >= 2 && JSON.stringify(nextCoords) !== JSON.stringify(coords)) {{
+          geom.setCoordinates(nextCoords.map(c => ol.proj.fromLonLat(c)));
         }}
       }}
       emitPath();
@@ -1451,6 +1633,7 @@ class OpenLayersMapProvider:
     let liveGeomKey = null;
     let appendMode = false;
     let appendBaseCoords = null;
+    let removeMode = false;
 
     function unwatchLine() {{
       if (liveGeomKey && ol.Observable && typeof ol.Observable.unByKey === 'function') {{
@@ -1462,6 +1645,9 @@ class OpenLayersMapProvider:
     let isClamping = false;
     let isSnapping = false;
     const homeSnapCoord = Array.isArray(data.home) && data.home.length >= 2 ? data.home : null;
+    const routeEditAnchorCoord = Array.isArray(data.route_edit_anchor) && data.route_edit_anchor.length >= 2
+      ? data.route_edit_anchor
+      : null;
     const homeSnapThresholdM = 100.0;
 
     function maybeSnapToHome(coords) {{
@@ -1473,6 +1659,16 @@ class OpenLayersMapProvider:
       if (first[0] === homeSnapCoord[0] && first[1] === homeSnapCoord[1]) return coords;
       const snapped = coords.slice();
       snapped[0] = [homeSnapCoord[0], homeSnapCoord[1]];
+      return snapped;
+    }}
+
+    function applyRouteEditAnchor(coords) {{
+      if (!routeEditAnchorCoord || !coords || !coords.length) return coords;
+      const snapped = coords.slice();
+      snapped[0] = [routeEditAnchorCoord[0], routeEditAnchorCoord[1]];
+      if (snapped.length < 2) {{
+        snapped.push([routeEditAnchorCoord[0], routeEditAnchorCoord[1]]);
+      }}
       return snapped;
     }}
 
@@ -1490,6 +1686,7 @@ class OpenLayersMapProvider:
           nextCoords = clamped;
         }}
         nextCoords = maybeSnapToHome(nextCoords);
+        nextCoords = applyRouteEditAnchor(nextCoords);
         if (JSON.stringify(nextCoords) !== JSON.stringify(coords)) {{
           isSnapping = true;
           geom.setCoordinates(nextCoords.map(c => ol.proj.fromLonLat(c)));
@@ -1542,10 +1739,12 @@ class OpenLayersMapProvider:
           coords = merged;
         }}
         coords = maybeSnapToHome(coords);
+        coords = applyRouteEditAnchor(coords);
         const clamped = clampPathToBattery(coords);
         if (geom && clamped && clamped.length >= 2 && JSON.stringify(clamped) !== JSON.stringify(coords)) {{
           coords = clamped;
         }}
+        coords = applyRouteEditAnchor(coords);
         if (geom) {{
           geom.setCoordinates(coords.map(c => ol.proj.fromLonLat(c)));
         }}
@@ -1605,25 +1804,52 @@ class OpenLayersMapProvider:
       return bestIdx;
     }}
 
-    function removeLastPoint() {{
+    function closestVertexIndex(coords, pixel) {{
+      if (!coords || !coords.length || !pixel) return null;
+      let bestIdx = null;
+      let bestDist = Infinity;
+      for (let i = 0; i < coords.length; i++) {{
+        const vertexPixel = map.getPixelFromCoordinate(ol.proj.fromLonLat(coords[i]));
+        if (!vertexPixel) continue;
+        const dx = pixel[0] - vertexPixel[0];
+        const dy = pixel[1] - vertexPixel[1];
+        const dist = Math.hypot(dx, dy);
+        if (dist < bestDist) {{
+          bestDist = dist;
+          bestIdx = i;
+        }}
+      }}
+      if (bestDist > 14) return null;
+      return bestIdx;
+    }}
+
+    function removePointAtPixel(pixel) {{
       const line = getLineFeature();
       if (!line) return;
       let coords = lineCoordsFromFeature(line);
-      if (!coords || coords.length < 2) {{
+      if (!coords || !coords.length) {{
         removeByType('LineString');
         updateSegmentOverlays([]);
         emitPath();
         return;
       }}
-      if (data.drone && coords.length >= 2) {{
-        const drone = data.drone;
-        const segIdx = closestSegmentIndex(coords, drone);
-        if (segIdx !== null && segIdx >= coords.length - 2) {{
-          console.log('PY_TOAST ' + JSON.stringify({{ message: 'Cannot remove segment under drone' }}));
-          return;
-        }}
+      const idx = closestVertexIndex(coords, pixel);
+      if (idx === null) {{
+        return;
       }}
-      coords = coords.slice(0, -1);
+      if (routeEditAnchorCoord && idx === 0) {{
+        console.log('PY_TOAST ' + JSON.stringify({{ message: 'Cannot remove route start under drone' }}));
+        return;
+      }}
+      coords = coords.slice();
+      coords.splice(idx, 1);
+      coords = applyRouteEditAnchor(coords);
+      if (coords.length < 2) {{
+        removeByType('LineString');
+        updateSegmentOverlays([]);
+        emitPath();
+        return;
+      }}
       const geom = line.getGeometry();
       if (geom) {{
         geom.setCoordinates(coords.map(c => ol.proj.fromLonLat(c)));
@@ -1659,9 +1885,20 @@ class OpenLayersMapProvider:
         view.setCenter(ol.proj.fromLonLat(data.center));
         view.setZoom(13);
       }},
-      drawPath: () => enableDraw('LineString'),
-      drawTarget: () => enableDraw('Point'),
-      stopDraw: () => enableDraw(''),
+      drawPath: () => {{
+        removeMode = false;
+        enableDraw('LineString');
+      }},
+      stopDraw: () => {{
+        removeMode = false;
+        enableDraw('');
+      }},
+      setRemoveMode: (flag) => {{
+        removeMode = !!flag;
+        if (removeMode) {{
+          enableDraw('');
+        }}
+      }},
       setAppendMode: (flag) => {{
         appendMode = !!flag;
         modify.setActive(appendMode);
@@ -1676,20 +1913,14 @@ class OpenLayersMapProvider:
         homeMode = !!flag;
       }},
       screenToGeo: (x, y) => (window.screenToGeo ? window.screenToGeo(x, y) : null),
-      removeLastPoint: () => removeLastPoint(),
-      clearPath: () => {{
-        removeByType('LineString');
-        updateSegmentOverlays([]);
-        emitPath();
-      }},
-      clearTarget: () => {{
-        removeByType('Point');
-        emitTarget();
-      }}
     }};
 
     map.on('singleclick', evt => {{
       if (drawInteraction) return;
+      if (removeMode) {{
+        removePointAtPixel(evt.pixel);
+        return;
+      }}
       if (homeMode) {{
         const lonLat = ol.proj.toLonLat(evt.coordinate);
         const payload = {{
@@ -1768,6 +1999,8 @@ class StaticImageMapProvider:
     def render_map(
         self, path: list[tuple[float, float]], token: int, path_kind: str | None = None
     ) -> Path:
+        folium = _get_folium()
+        draw_cls = _get_folium_draw()
         lat_min = self.bounds.lat_min
         lon_min = self.bounds.lon_min
         lat_max = self.bounds.lat_max
@@ -1881,7 +2114,7 @@ class StaticImageMapProvider:
         )
         fmap.fit_bounds(bounds)
 
-        Draw(
+        draw_cls(
             export=False,
             draw_options={
                 "polyline": {"shapeOptions": {"color": "#000000"}},

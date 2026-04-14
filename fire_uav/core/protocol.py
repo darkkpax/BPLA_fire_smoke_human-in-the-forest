@@ -8,6 +8,7 @@ from typing import List, Literal, Union
 from pydantic import BaseModel
 
 from fire_uav.module_core.schema import GeoDetection, Route, TelemetrySample, Waypoint as CoreWaypoint
+from fire_uav.utils.time import utc_now
 
 
 class TelemetryMessage(BaseModel):
@@ -125,7 +126,7 @@ def make_map_snapshot_info(uav_id: str, image_path: str, bounds: MapBounds) -> M
         uav_id=uav_id,
         image_path=image_path,
         bounds=bounds,
-        timestamp=datetime.utcnow(),
+        timestamp=utc_now(),
     )
 
 

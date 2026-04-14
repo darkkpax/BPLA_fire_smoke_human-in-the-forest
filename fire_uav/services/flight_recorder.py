@@ -9,6 +9,7 @@ from pathlib import Path
 from fire_uav.module_core.geometry import haversine_m
 from fire_uav.module_core.schema import TelemetrySample
 from fire_uav.services.bus import Event, bus
+from fire_uav.utils.time import utc_iso_z, utc_now
 
 log = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ class FlightRecorder:
     def _on_start(self, payload: object) -> None:
         if self._session_dir is not None:
             return
-        ts = datetime.utcnow()
+        ts = utc_now()
         root_dir = Path(__file__).resolve().parents[2]
         self._session_dir = root_dir / "data" / "flights" / ts.strftime("%Y-%m-%d_%H-%M-%S")
         self._session_dir.mkdir(parents=True, exist_ok=True)
@@ -95,7 +96,7 @@ class FlightRecorder:
         if self._session_dir is None:
             return
         self._record_event(Event.FLIGHT_SESSION_ENDED, payload)
-        ended_at = datetime.utcnow()
+        ended_at = utc_now()
         summary = FlightSummary(
             started_at=self._started_at.isoformat() + "Z" if self._started_at else None,
             ended_at=ended_at.isoformat() + "Z",
@@ -121,7 +122,7 @@ class FlightRecorder:
             return
         self._objects_seen.add(obj_id)
         payload = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": utc_iso_z(),
             **payload,
         }
         self._objects_fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
@@ -140,7 +141,7 @@ class FlightRecorder:
 
     def _record_event(self, event: Event, payload: object) -> None:
         event_payload = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": utc_iso_z(),
             "event": str(event),
             "payload": payload,
         }

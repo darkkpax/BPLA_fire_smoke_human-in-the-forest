@@ -16,6 +16,7 @@ dependencies = [
     "httpx>=0.28",
     "requests>=2.32",
     "prometheus-client>=0.23",
+    "av>=15,<16",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +37,7 @@ ground = [
     "PySide6-Essentials>=6.7",
     "folium>=0.20",
     "branca>=0.8",
+    "av>=15,<16",
     "opencv-python-headless>=4.10",
 ]
 dev = [
@@ -115,6 +117,7 @@ prometheus-client = "^0.23.0"
 prometheus-fastapi-instrumentator = "^7.1.0"
 requests = "^2.32"
 pyyaml = "^6.0"
+av = ">=15,<16"
 shapely = "^2.0"
 ortools = "^9.14.0"
 ultralytics = "^8.3.0"

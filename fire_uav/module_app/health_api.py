@@ -5,25 +5,26 @@ from typing import Optional, Set
 
 from fastapi import FastAPI, Response
 from prometheus_client import REGISTRY, generate_latest
+from fire_uav.utils.time import utc_now
 
 
 class ModuleHealthState:
     """Tracks runtime health metrics for module_app."""
 
     def __init__(self) -> None:
-        self.start_time: datetime = datetime.utcnow()
+        self.start_time: datetime = utc_now()
         self.last_telemetry: Optional[datetime] = None
         self.last_detection: Optional[datetime] = None
         self.unhealthy_reasons: Set[str] = set()
 
     def mark_start(self) -> None:
-        self.start_time = datetime.utcnow()
+        self.start_time = utc_now()
 
     def update_telemetry(self, ts: Optional[datetime] = None) -> None:
-        self.last_telemetry = ts or datetime.utcnow()
+        self.last_telemetry = ts or utc_now()
 
     def update_detection(self, ts: Optional[datetime] = None) -> None:
-        self.last_detection = ts or datetime.utcnow()
+        self.last_detection = ts or utc_now()
 
     def mark_unhealthy(self, reason: str) -> None:
         self.unhealthy_reasons.add(reason)
@@ -67,7 +68,7 @@ def configure_health(
 @app.get("/health", tags=["health"])
 async def health() -> dict:
     """Lightweight health endpoint."""
-    now = datetime.utcnow()
+    now = utc_now()
     telemetry_age = (
         (now - health_state.last_telemetry).total_seconds() if health_state.last_telemetry else None
     )

@@ -25,10 +25,11 @@ class TrackedObjectState:
 
 
 class ObjectRegistry:
-    def __init__(self) -> None:
+    def __init__(self, *, spatial_match_radius_m: float = 90.0) -> None:
         self._objects: Dict[str, TrackedObjectState] = {}
         self._by_track: Dict[Tuple[int, int], str] = {}
         self._counter: int = 0
+        self._spatial_match_radius_m: float = max(1.0, float(spatial_match_radius_m))
 
     def _new_object_id(self) -> str:
         oid = f"obj_{self._counter:06d}"
@@ -42,7 +43,7 @@ class ObjectRegistry:
             return None
         return self._objects.get(obj_id)
 
-    def _find_spatial(self, detection: GeoDetection, max_distance_m: float = 15.0) -> TrackedObjectState | None:
+    def _find_spatial(self, detection: GeoDetection) -> TrackedObjectState | None:
         """Fallback matching when track_id is unavailable: find closest object of same class."""
         closest: TrackedObjectState | None = None
         closest_dist = float("inf")
@@ -50,7 +51,7 @@ class ObjectRegistry:
             if state.class_id != detection.class_id:
                 continue
             dist = haversine_m((state.lat, state.lon), (detection.lat, detection.lon))
-            if dist < max_distance_m and dist < closest_dist:
+            if dist < self._spatial_match_radius_m and dist < closest_dist:
                 closest = state
                 closest_dist = dist
         return closest
@@ -66,8 +67,7 @@ class ObjectRegistry:
             state = self.find_by_track(track_id, detection.class_id)
 
         if state is None:
-            spatial_match = self._find_spatial(detection) if track_id is None else None
-            state = spatial_match
+            state = self._find_spatial(detection)
 
         if state is None:
             state = TrackedObjectState(

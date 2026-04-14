@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 import fire_uav.infrastructure.providers as deps
 from fire_uav.api.sim_api import app, capabilities
 from fire_uav.services.bus import Event, bus
+from fire_uav.utils.time import utc_iso_z
 
 client = TestClient(app)
 
@@ -46,7 +47,7 @@ def test_telemetry_ingest_and_health() -> None:
     msg = {
         "protocol_version": 1,
         "uav_id": "uav-telemetry",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": utc_iso_z(),
         "lat": 56.0,
         "lon": 92.9,
         "alt": 120.0,

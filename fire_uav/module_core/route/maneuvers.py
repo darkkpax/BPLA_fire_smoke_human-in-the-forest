@@ -7,6 +7,7 @@ from typing import List
 
 from fire_uav.module_core.geometry import haversine_m, offset_latlon
 from fire_uav.module_core.interfaces.energy import IEnergyModel
+from fire_uav.module_core.route.base_location import resolve_base_location
 from fire_uav.module_core.schema import Route, TelemetrySample, Waypoint, WorldCoord
 
 log = logging.getLogger(__name__)
@@ -71,29 +72,9 @@ def _resolve_base_location(
     base_route: Route,
     current_state: TelemetrySample,
 ) -> WorldCoord:
-    for lat_key, lon_key in (("home_lat", "home_lon"), ("base_lat", "base_lon")):
-        lat = getattr(settings, lat_key, None)
-        lon = getattr(settings, lon_key, None)
-        if lat is not None and lon is not None:
-            try:
-                return WorldCoord(lat=float(lat), lon=float(lon))
-            except (TypeError, ValueError):
-                pass
-
-    if base_route.waypoints:
-        wp = base_route.waypoints[0]
-        return WorldCoord(lat=wp.lat, lon=wp.lon)
-
-    if math.isfinite(float(current_state.lat)) and math.isfinite(float(current_state.lon)):
-        return WorldCoord(lat=current_state.lat, lon=current_state.lon)
-
-    center = getattr(settings, "map_center", None)
-    if isinstance(center, (list, tuple)) and len(center) >= 2:
-        try:
-            return WorldCoord(lat=float(center[0]), lon=float(center[1]))
-        except (TypeError, ValueError):
-            pass
-
+    resolved = resolve_base_location(settings, base_route, current_state)
+    if resolved is not None:
+        return resolved
     return WorldCoord(lat=current_state.lat, lon=current_state.lon)
 
 
@@ -112,17 +93,61 @@ def build_rejoin(exit_wp: Waypoint, base_route: Route) -> List[Waypoint]:
     if base_route.active_index is not None:
         start_idx = max(0, min(int(base_route.active_index), len(base_route.waypoints) - 1))
 
-    closest_idx = start_idx
-    closest_dist = float("inf")
-    for idx in range(start_idx, len(base_route.waypoints)):
-        wp = base_route.waypoints[idx]
-        dist = haversine_m((exit_wp.lat, exit_wp.lon), (wp.lat, wp.lon))
-        if dist < closest_dist:
-            closest_dist = dist
-            closest_idx = idx
+    if start_idx >= len(base_route.waypoints) - 1:
+        return [base_route.waypoints[start_idx]]
 
-    path = list(base_route.waypoints[closest_idx:])
-    return path
+    def _to_local_m(lat: float, lon: float) -> tuple[float, float]:
+        scale_lat = 111_320.0
+        scale_lon = 111_320.0 * math.cos(math.radians(float(exit_wp.lat)))
+        return (
+            (float(lon) - float(exit_wp.lon)) * scale_lon,
+            (float(lat) - float(exit_wp.lat)) * scale_lat,
+        )
+
+    best_point: Waypoint | None = None
+    best_suffix_start = start_idx
+    best_dist = float("inf")
+
+    for idx in range(start_idx, len(base_route.waypoints) - 1):
+        start_wp = base_route.waypoints[idx]
+        end_wp = base_route.waypoints[idx + 1]
+        sx, sy = _to_local_m(start_wp.lat, start_wp.lon)
+        ex, ey = _to_local_m(end_wp.lat, end_wp.lon)
+        dx = ex - sx
+        dy = ey - sy
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq <= 1e-6:
+            candidates = (
+                (start_wp, idx),
+                (end_wp, idx + 1),
+            )
+        else:
+            t = max(0.0, min(1.0, (-(sx * dx + sy * dy)) / seg_len_sq))
+            candidates = (
+                (
+                    Waypoint(
+                        lat=float(start_wp.lat) + (float(end_wp.lat) - float(start_wp.lat)) * t,
+                        lon=float(start_wp.lon) + (float(end_wp.lon) - float(start_wp.lon)) * t,
+                        alt=float(start_wp.alt) + (float(end_wp.alt) - float(start_wp.alt)) * t,
+                    ),
+                    idx + 1 if t > 1e-3 else idx,
+                ),
+            )
+
+        for candidate, suffix_start in candidates:
+            dist = haversine_m((exit_wp.lat, exit_wp.lon), (candidate.lat, candidate.lon))
+            if dist < best_dist:
+                best_dist = dist
+                best_point = candidate
+                best_suffix_start = suffix_start
+
+    if best_point is None:
+        return list(base_route.waypoints[start_idx:])
+
+    suffix = list(base_route.waypoints[best_suffix_start:])
+    if suffix and haversine_m((best_point.lat, best_point.lon), (suffix[0].lat, suffix[0].lon)) <= 0.5:
+        return suffix
+    return [best_point, *suffix]
 
 
 def build_energy_aware_orbit(
@@ -134,6 +159,7 @@ def build_energy_aware_orbit(
     base_location: WorldCoord,
     energy_model: IEnergyModel,
     orbit_params: OrbitParams,
+    allow_unsafe: bool = False,
 ) -> Route | None:
     preview_orbit = _build_orbit_arc(
         target_lat,
@@ -187,21 +213,30 @@ def build_energy_aware_orbit(
             reduced_angles.append(360.0 * loops)
     reduced_angles.extend([180.0, 90.0])
 
-    for angle in reduced_angles:
-        orbit = _build_orbit_arc(
-            target_lat,
-            target_lon,
-            orbit_params.radius_m,
-            orbit_params.altitude_m,
-            orbit_params.points_per_circle,
-            angle,
-        )
-        candidate = _assemble_route(orbit)
-        if _is_feasible(candidate):
-            log.warning("EnergyModel: reduced orbit to %.0f deg to fit remaining battery.", angle)
-            return candidate
+    radius_factors = [1.0, 0.8, 0.65, 0.5, 0.35]
+    for radius_factor in radius_factors:
+        radius_m = max(8.0, orbit_params.radius_m * radius_factor)
+        for angle in reduced_angles:
+            orbit = _build_orbit_arc(
+                target_lat,
+                target_lon,
+                radius_m,
+                orbit_params.altitude_m,
+                orbit_params.points_per_circle,
+                angle,
+            )
+            candidate = _assemble_route(orbit)
+            if _is_feasible(candidate):
+                log.warning(
+                    "EnergyModel: reduced orbit to %.0f deg / %.1fm radius to fit remaining battery.",
+                    angle,
+                    radius_m,
+                )
+                return candidate
 
     log.warning("EnergyModel: insufficient battery for orbit maneuver.")
+    if allow_unsafe:
+        return route
     return None
 
 
@@ -212,6 +247,7 @@ def build_maneuver(
     base_route: Route,
     energy_model: IEnergyModel,
     settings,
+    allow_unsafe: bool = False,
 ) -> Route | None:
     raw_altitude = getattr(settings, "maneuver_alt_m", None)
     try:
@@ -247,6 +283,7 @@ def build_maneuver(
         base_location=base_location,
         energy_model=energy_model,
         orbit_params=orbit_params,
+        allow_unsafe=allow_unsafe,
     )
 
 

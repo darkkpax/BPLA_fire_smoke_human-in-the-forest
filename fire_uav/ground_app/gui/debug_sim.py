@@ -17,6 +17,7 @@ from fire_uav.module_core.schema import GeoDetection, TelemetrySample
 from fire_uav.module_core.detections.notifications import JsonNotificationWriter
 from fire_uav.module_core.detections.registry import ObjectRegistry
 from fire_uav.module_core.detections.manager import ObjectNotificationManager
+from fire_uav.utils.time import utc_now
 
 _log = logging.getLogger(__name__)
 
@@ -106,7 +107,7 @@ class DebugSimulationService:
             lon=float(lon),
             alt=120.0,
             frame_id="debug",
-            timestamp=datetime.utcnow(),
+            timestamp=utc_now(),
             track_id=None,
         )
         self._object_manager.handle_confirmed_detection(det)
@@ -171,7 +172,7 @@ class DebugSimulationService:
             vz=vz,
             battery=battery_percent / 100.0,
             battery_percent=battery_percent,
-            timestamp=datetime.utcnow(),
+            timestamp=utc_now(),
             source=source,
         )
         self._last_pos = pos

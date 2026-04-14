@@ -10,6 +10,7 @@ import fire_uav.infrastructure.providers as deps
 from fire_uav.module_core.geometry import interpolate_path_point
 from fire_uav.module_core.route.python_planner import PythonRoutePlanner
 from fire_uav.module_core.schema import Route, TelemetrySample, Waypoint
+from fire_uav.utils.time import utc_now
 
 
 class PlannerVM:
@@ -123,7 +124,7 @@ class PlannerVM:
             yaw=0.0,
             battery=1.0,
             battery_percent=100.0,
-            timestamp=datetime.utcnow(),
+            timestamp=utc_now(),
         )
 
         maneuver = self._route_planner.plan_maneuver(

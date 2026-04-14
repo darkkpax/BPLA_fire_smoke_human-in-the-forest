@@ -7,6 +7,7 @@ from datetime import datetime
 from fire_uav.core.telemetry import normalize_battery_value
 from fire_uav.module_core.adapters.interfaces import IUavAdapter, IUavTelemetryConsumer
 from fire_uav.module_core.schema import Route, TelemetrySample
+from fire_uav.utils.time import utc_now
 
 
 class StubUavAdapter(IUavAdapter):
@@ -77,7 +78,7 @@ class StubUavAdapter(IUavAdapter):
                     roll=0.0,
                     battery=battery_fraction,
                     battery_percent=battery_percent,
-                    timestamp=datetime.utcnow(),
+                    timestamp=utc_now(),
                     source="stub",
                 )
                 try:

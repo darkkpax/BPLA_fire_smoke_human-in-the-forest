@@ -12,6 +12,7 @@ from fire_uav.core.telemetry import (
 )
 from fire_uav.module_core.energy.python_energy_model import PythonEnergyModel
 from fire_uav.module_core.schema import Route, TelemetrySample, Waypoint, WorldCoord
+from fire_uav.utils.time import utc_now
 
 
 def test_normalize_battery_value_fraction() -> None:
@@ -29,7 +30,7 @@ def test_normalize_battery_value_percent() -> None:
 def test_telemetry_sample_from_message() -> None:
     msg = TelemetryMessage(
         uav_id="test",
-        timestamp=datetime.utcnow(),
+        timestamp=utc_now(),
         lat=55.0,
         lon=37.0,
         alt=120.0,
@@ -72,14 +73,14 @@ def test_energy_model_fallback_percent() -> None:
 def test_ws_json_default_handles_datetime() -> None:
     msg = TelemetryMessage(
         uav_id="test",
-        timestamp=datetime.utcnow(),
+        timestamp=utc_now(),
         lat=55.0,
         lon=37.0,
         alt=120.0,
         yaw=90.0,
         battery=0.8,
     )
-    payload = {"msg": msg, "ts": datetime.utcnow()}
+    payload = {"msg": msg, "ts": utc_now()}
     encoded = json.dumps(payload, default=_json_default)
     assert '"telemetry"' in encoded
     assert '"timestamp"' in encoded

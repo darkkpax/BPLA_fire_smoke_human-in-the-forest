@@ -67,6 +67,8 @@ class MissionActionPolicy:
             mission_state == MissionState.IN_FLIGHT
             and commands_enabled
             and telemetry_available
+            and not route_edit_mode
+            and active_path_mode == ActivePathMode.NORMAL
             and confirmed_object_count > 0
             and (confirmed_object_count == 1 or selected_object_id is not None)
             and supports_orbit
@@ -75,6 +77,8 @@ class MissionActionPolicy:
             mission_state == MissionState.IN_FLIGHT
             and commands_enabled
             and telemetry_available
+            and not route_edit_mode
+            and active_path_mode == ActivePathMode.NORMAL
             and confirmed_object_count > 0
             and supports_orbit
         )

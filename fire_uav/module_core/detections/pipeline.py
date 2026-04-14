@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from fire_uav.config import settings
 from fire_uav.domain.video.camera import CameraParams
 from fire_uav.module_core.detections.aggregator import DetectionAggregator, DetectionEvent
+from fire_uav.module_core.geometry import haversine_m
 from fire_uav.module_core.detections.manager import ObjectNotificationManager
 from fire_uav.module_core.detections.notifications import JsonNotificationWriter
 from fire_uav.module_core.detections.registry import ObjectRegistry
@@ -21,6 +22,7 @@ from fire_uav.module_core.interfaces.geo import IGeoProjector
 from fire_uav.module_core.schema import GeoDetection, TelemetrySample, WorldCoord
 from fire_uav.services.targets.target_tracker import TargetObservation, TargetTracker
 from fire_uav.services.telemetry.transmitter import Transmitter
+from fire_uav.utils.time import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +82,11 @@ class DetectionPipeline:
                 logger.debug("Failed to apply explicit camera params to projector", exc_info=True)
         self.transmitter = transmitter
         self._smoother = build_smoother(settings)
-        self._registry = ObjectRegistry()
+        self._registry = ObjectRegistry(
+            spatial_match_radius_m=float(
+                getattr(settings, "object_registry_match_radius_m", 90.0) or 90.0
+            )
+        )
         notifications_dir = Path(getattr(settings, "notifications_dir", "data/notifications"))
         self._notification_manager = ObjectNotificationManager(
             registry=self._registry,
@@ -103,7 +109,7 @@ class DetectionPipeline:
         if not payload.detections:
             return []
 
-        events: List[DetectionEvent] = []
+        projected_events: list[tuple[DetectionEvent, tuple[float, float, float, float]]] = []
         smoothed = self._smoother.assign_and_smooth(payload.detections)
         for det, smoothed_bbox, track_id in smoothed:
             projected = self.projector.project_bbox_to_ground(
@@ -122,20 +128,24 @@ class DetectionPipeline:
                 continue
             lat, lon = projected
             coord = WorldCoord(lat=lat, lon=lon)
-            events.append(
-                DetectionEvent(
-                    class_id=det.class_id,
-                    confidence=det.confidence,
-                    location=coord,
-                    frame_id=det.frame_id or payload.frame_id,
-                    timestamp=det.timestamp or payload.captured_at,
-                    track_id=track_id,
+            projected_events.append(
+                (
+                    DetectionEvent(
+                        class_id=det.class_id,
+                        confidence=det.confidence,
+                        location=coord,
+                        frame_id=det.frame_id or payload.frame_id,
+                        timestamp=det.timestamp or payload.captured_at,
+                        track_id=track_id,
+                    ),
+                    tuple(float(v) for v in smoothed_bbox),
                 )
             )
 
         if self.aggregator is None:
             return []
 
+        events = self._dedupe_projected_events(projected_events)
         with self._lock:
             aggregated = self.aggregator.add_many(events)
 
@@ -145,9 +155,51 @@ class DetectionPipeline:
                 self._notification_manager.handle_confirmed_detection(det)
                 self._publish_visualizer(det)
             if self._detection_callback:
-                self._detection_callback(confirmed[-1].timestamp or datetime.utcnow())
+                self._detection_callback(confirmed[-1].timestamp or utc_now())
         self._transmit(confirmed)
         return confirmed
+
+    def _dedupe_projected_events(
+        self,
+        projected_events: Sequence[tuple[DetectionEvent, tuple[float, float, float, float]]],
+    ) -> list[DetectionEvent]:
+        if not projected_events:
+            return []
+        merge_px = float(getattr(settings, "dedup_bbox_center_distance_px", 72.0) or 72.0)
+        merge_geo_m = float(getattr(settings, "dedup_geo_distance_m", 45.0) or 45.0)
+        kept: list[tuple[DetectionEvent, tuple[float, float, float, float]]] = []
+        for event, bbox in sorted(
+            projected_events,
+            key=lambda item: float(item[0].confidence),
+            reverse=True,
+        ):
+            duplicate = False
+            for prev_event, prev_bbox in kept:
+                if prev_event.class_id != event.class_id:
+                    continue
+                if self._bbox_center_distance_px(prev_bbox, bbox) > merge_px:
+                    continue
+                dist_m = haversine_m(
+                    (prev_event.location.lat, prev_event.location.lon),
+                    (event.location.lat, event.location.lon),
+                )
+                if dist_m <= merge_geo_m:
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append((event, bbox))
+        return [event for event, _bbox in kept]
+
+    @staticmethod
+    def _bbox_center_distance_px(
+        a: tuple[float, float, float, float],
+        b: tuple[float, float, float, float],
+    ) -> float:
+        ax = (a[0] + a[2]) * 0.5
+        ay = (a[1] + a[3]) * 0.5
+        bx = (b[0] + b[2]) * 0.5
+        by = (b[1] + b[3]) * 0.5
+        return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
 
     # ------------------------------------------------------------------ #
     def _transmit(self, detections: Sequence[GeoDetection]) -> None:

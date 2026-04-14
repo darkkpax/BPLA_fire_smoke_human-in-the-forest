@@ -8,6 +8,7 @@ from typing import List, Optional
 import httpx
 
 from fire_uav.core.protocol import ObjectMessage, RouteMessage, TelemetryMessage, Waypoint
+from fire_uav.utils.time import utc_now
 
 
 class VisualizerClient:
@@ -78,7 +79,7 @@ class VisualizerClient:
 async def _demo() -> None:
     client = VisualizerClient("http://127.0.0.1:8000", uav_id="demo_uav")
     await client.send_telemetry(
-        timestamp=datetime.utcnow(),
+        timestamp=utc_now(),
         lat=55.0,
         lon=37.0,
         alt=100.0,

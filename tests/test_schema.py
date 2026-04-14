@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from fire_uav.module_core.schema import GeoDetection, Route, TelemetrySample, Waypoint
+from fire_uav.utils.time import utc_now
 
 
 def test_telemetry_sample_creation() -> None:
@@ -36,7 +37,7 @@ def test_route_roundtrip() -> None:
 
 
 def test_geo_detection_creation() -> None:
-    now = datetime.utcnow()
+    now = utc_now()
     det = GeoDetection(
         class_id=1,
         confidence=0.9,

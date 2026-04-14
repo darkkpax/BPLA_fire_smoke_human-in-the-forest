@@ -36,6 +36,8 @@ class Event(StrEnum):
     # детектор
     DETECTION = "detection"
     CONF_CHANGE = "conf_change"
+    DETECTOR_START = "detector_start"
+    DETECTOR_STOP = "detector_stop"
     OBJECT_CONFIRMED_UI = "object_confirmed_ui"
 
     # прочее можно добавлять по мере надобности

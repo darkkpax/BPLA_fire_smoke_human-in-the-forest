@@ -18,7 +18,8 @@ __pycache__/
 venv/
 env/
 ENV/
-
+.gitignore.txt
+importtime*.txt
 # Dependencies / builds
 build/
 dist/
@@ -52,6 +53,7 @@ htmlcov/
 
 # Project data outputs (runtime artifacts)
 data/outputs/
+data/flights/
 data/logs/
 data/notifications/
 data/tmp/

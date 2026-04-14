@@ -44,6 +44,26 @@ def test_build_rejoin_does_not_jump_back_to_completed_segment() -> None:
     assert rejoin[1] == route.waypoints[3]
 
 
+def test_build_rejoin_uses_forward_segment_point_instead_of_far_old_waypoint() -> None:
+    route = Route(
+        version=1,
+        active_index=0,
+        waypoints=[
+            Waypoint(lat=56.0000, lon=92.9000, alt=120.0),
+            Waypoint(lat=56.0000, lon=92.9100, alt=120.0),
+            Waypoint(lat=56.0000, lon=92.9200, alt=120.0),
+        ],
+    )
+    exit_wp = Waypoint(lat=56.0001, lon=92.9150, alt=120.0)
+
+    rejoin = build_rejoin(exit_wp, route)
+
+    assert rejoin
+    assert len(rejoin) >= 2
+    assert haversine_m((exit_wp.lat, exit_wp.lon), (rejoin[0].lat, rejoin[0].lon)) < 100.0
+    assert rejoin[-1] == route.waypoints[-1]
+
+
 def test_build_maneuver_falls_back_to_current_altitude_when_setting_is_none() -> None:
     class _Settings:
         maneuver_alt_m = None
@@ -131,6 +151,52 @@ def test_build_maneuver_uses_route_start_before_far_map_center_for_energy_base()
 
     assert maneuver is not None
     assert len(maneuver.waypoints) > len(route.waypoints)
+
+
+def test_build_maneuver_ignores_stale_home_from_other_region() -> None:
+    class _Settings:
+        maneuver_alt_m = None
+        orbit_radius_m = 50.0
+        orbit_points_per_circle = 12
+        orbit_loops = 1
+        home_lat = 56.01419
+        home_lon = 92.843638
+        base_lat = None
+        base_lon = None
+        map_center = (56.02, 92.9)
+
+    current = TelemetrySample(
+        lat=47.6081,
+        lon=-122.3358,
+        alt=120.0,
+        yaw=0.0,
+        pitch=0.0,
+        roll=0.0,
+        battery=0.82,
+        battery_percent=82.0,
+    )
+    route = Route(
+        version=1,
+        active_index=1,
+        waypoints=[
+            Waypoint(lat=47.6054, lon=-122.3352, alt=120.0),
+            Waypoint(lat=47.6082, lon=-122.3358, alt=120.0),
+            Waypoint(lat=47.6080, lon=-122.3260, alt=120.0),
+            Waypoint(lat=47.6047, lon=-122.3270, alt=120.0),
+        ],
+    )
+
+    maneuver = build_maneuver(
+        current_state=current,
+        target_lat=47.6085,
+        target_lon=-122.3357,
+        base_route=route,
+        energy_model=PythonEnergyModel(max_flight_distance_m=15000.0, min_return_percent=20.0),
+        settings=_Settings(),
+    )
+
+    assert maneuver is not None
+    assert maneuver.waypoints
 
 
 def test_build_maneuver_returns_none_when_orbit_is_not_energy_feasible() -> None:

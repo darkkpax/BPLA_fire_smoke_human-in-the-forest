@@ -9,6 +9,7 @@ from uuid import uuid4
 from fire_uav.core.telemetry import normalize_battery_value
 from fire_uav.module_core.contract.v1 import CapabilitiesV1, RouteV1, TelemetryV1, WaypointV1
 from fire_uav.module_core.schema import Route, TelemetrySample, Waypoint
+from fire_uav.utils.time import utc_now
 
 
 class CapabilitiesDict(TypedDict, total=False):
@@ -47,7 +48,7 @@ def route_internal_to_v1(route: Route, *, uav_id: str, mode: str = "MISSION") ->
         route_id=f"route-{uuid4().hex}",
         waypoints=waypoints,
         mode=mode,
-        created_at=datetime.utcnow(),
+        created_at=utc_now(),
     )
 
 

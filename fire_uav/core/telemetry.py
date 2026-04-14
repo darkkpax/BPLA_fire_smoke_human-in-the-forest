@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
-
 from fire_uav.core.protocol import TelemetryMessage
 from fire_uav.module_core.schema import TelemetrySample
+from fire_uav.utils.time import utc_now
 
 
 def normalize_battery_value(battery: float | None) -> tuple[float, float | None]:
@@ -24,7 +23,7 @@ def coerce_battery_percent(battery: float, battery_percent: float | None) -> flo
 
 def telemetry_sample_from_message(msg: TelemetryMessage) -> TelemetrySample:
     battery_fraction, battery_percent = normalize_battery_value(getattr(msg, "battery", None))
-    timestamp = getattr(msg, "timestamp", None) or datetime.utcnow()
+    timestamp = getattr(msg, "timestamp", None) or utc_now()
     return TelemetrySample(
         lat=msg.lat,
         lon=msg.lon,

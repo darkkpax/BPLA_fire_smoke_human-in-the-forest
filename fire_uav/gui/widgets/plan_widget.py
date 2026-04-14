@@ -17,6 +17,8 @@ import fire_uav.infrastructure.providers as deps
 from fire_uav.config import settings
 from fire_uav.gui.utils.gui_toast import show_toast
 from fire_uav.gui.viewmodels.planner_vm import PlannerVM
+from fire_uav.module_core.route.base_location import resolve_base_location
+from fire_uav.module_core.schema import Route, TelemetrySample, Waypoint
 
 # mypy: disable-error-code=call-arg
 
@@ -143,24 +145,31 @@ class PlanWidget(QWidget):
         self._view.setUrl(QUrl.fromLocalFile(str(self._tmp_html)))
 
     def _fallback_base_latlng(self, path: list[tuple[float, float]]) -> list[float] | None:
-        for lat_key, lon_key in (("home_lat", "home_lon"), ("base_lat", "base_lon")):
-            lat = getattr(settings, lat_key, None)
-            lon = getattr(settings, lon_key, None)
-            if lat is not None and lon is not None:
-                try:
-                    return [float(lat), float(lon)]
-                except (TypeError, ValueError):
-                    continue
-        center = getattr(settings, "map_center", None)
-        if isinstance(center, (list, tuple)) and len(center) >= 2:
+        route = Route(
+            version=1,
+            waypoints=[Waypoint(lat=lat, lon=lon, alt=0.0) for lat, lon in path],
+            active_index=0 if path else None,
+        )
+        latest = getattr(deps, "latest_telemetry", None)
+        telemetry = None
+        if latest is not None and hasattr(latest, "lat") and hasattr(latest, "lon"):
             try:
-                return [float(center[0]), float(center[1])]
-            except (TypeError, ValueError):
-                return None
-        if path:
-            lat, lon = path[0]
-            return [float(lat), float(lon)]
-        return None
+                telemetry = TelemetrySample(
+                    lat=float(latest.lat),
+                    lon=float(latest.lon),
+                    alt=float(getattr(latest, "alt", 0.0) or 0.0),
+                    yaw=float(getattr(latest, "yaw", 0.0) or 0.0),
+                    pitch=float(getattr(latest, "pitch", 0.0) or 0.0),
+                    roll=float(getattr(latest, "roll", 0.0) or 0.0),
+                    battery=float(getattr(latest, "battery", 1.0) or 1.0),
+                    battery_percent=getattr(latest, "battery_percent", None),
+                )
+            except Exception:
+                telemetry = None
+        resolved = resolve_base_location(settings, route, telemetry)
+        if resolved is None:
+            return None
+        return [float(resolved.lat), float(resolved.lon)]
 
     def _route_stats_payload(self, path: list[tuple[float, float]]) -> dict:
         raw_stats = getattr(deps, "route_stats", None)

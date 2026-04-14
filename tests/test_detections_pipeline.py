@@ -7,6 +7,7 @@ from fire_uav.config import settings
 from fire_uav.module_core.detections import DetectionAggregator, DetectionBatchPayload, RawDetectionPayload
 from fire_uav.module_core.detections.pipeline import DetectionPipeline
 from fire_uav.module_core.schema import TelemetrySample
+from fire_uav.utils.time import utc_now
 
 
 class DummyProjector:
@@ -69,7 +70,7 @@ def test_detection_pipeline_creates_notifications(tmp_path: Path) -> None:
         yaw=45.0,
         battery=0.9,
     )
-    t0 = datetime.utcnow()
+    t0 = utc_now()
 
     # First batch does not meet votes_required yet
     pipeline.process_batch(_make_batch("frame_1", t0, telemetry))

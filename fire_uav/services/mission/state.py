@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Iterable, Sequence
 
 from fire_uav.services.bus import Event, bus
+from fire_uav.utils.time import utc_iso_z, utc_now
 
 log = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ class MissionStateMachine:
         if not self._is_valid_plan(path):
             log.warning("Plan confirmation rejected: invalid route.")
             return False
-        self._plan = PlanSnapshot(points=path, confirmed_at=datetime.utcnow())
+        self._plan = PlanSnapshot(points=path, confirmed_at=utc_now())
         self._refresh_ready_state(reason="plan_confirmed")
         return True
 
@@ -80,7 +81,7 @@ class MissionStateMachine:
         bus.emit(
             Event.FLIGHT_SESSION_STARTED,
             {
-                "started_at": datetime.utcnow().isoformat() + "Z",
+                "started_at": utc_iso_z(),
                 "plan": self.confirmed_plan or [],
             },
         )
@@ -102,7 +103,7 @@ class MissionStateMachine:
         self._set_state(MissionState.POSTFLIGHT, reason=reason or "land_complete")
         bus.emit(
             Event.FLIGHT_SESSION_ENDED,
-            {"ended_at": datetime.utcnow().isoformat() + "Z", "reason": reason or "land_complete"},
+            {"ended_at": utc_iso_z(), "reason": reason or "land_complete"},
         )
 
     def abort_to_preflight(self, reason: str | None = None) -> None:
@@ -110,7 +111,7 @@ class MissionStateMachine:
             self._session_active = False
             bus.emit(
                 Event.FLIGHT_SESSION_ENDED,
-                {"ended_at": datetime.utcnow().isoformat() + "Z", "reason": reason or "abort"},
+                {"ended_at": utc_iso_z(), "reason": reason or "abort"},
             )
         self._plan = None
         self._set_state(MissionState.PREFLIGHT, reason=reason or "abort")

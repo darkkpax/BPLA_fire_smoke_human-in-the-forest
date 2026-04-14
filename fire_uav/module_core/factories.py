@@ -47,6 +47,9 @@ def get_energy_model(settings) -> IEnergyModel:  # noqa: ANN001
     else:
         log.info("Using PythonEnergyModel (native disabled).")
     return PythonEnergyModel(
+        cruise_speed_mps=float(getattr(settings, "cruise_speed_mps", 12.0) or 12.0),
+        power_cruise_w=float(getattr(settings, "power_cruise_w", 45.0) or 45.0),
+        battery_wh=float(getattr(settings, "battery_wh", 27.0) or 27.0),
         max_flight_distance_m=getattr(settings, "max_flight_distance_m", 15000.0),
         min_return_percent=getattr(settings, "min_return_percent", 20.0),
         critical_battery_percent=getattr(settings, "critical_battery_percent", 10.0),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from threading import Event
 from typing import List
 
@@ -44,6 +45,9 @@ class LifecycleManager:
             for c in self._components:
                 if c.ident is None:
                     _log.debug("Skipping join for non-started component %s", c.name)
+                    continue
+                if c.ident == threading.get_ident():
+                    _log.debug("Skipping self-join for component %s", c.name)
                     continue
                 _log.debug("Joining %s", c.name)
                 c.join(timeout)

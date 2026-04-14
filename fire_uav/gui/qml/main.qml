@@ -20,6 +20,9 @@ ApplicationWindow {
     property color borderColor: "#333333"
     property color textPrimary: "#ffffff"
     property color textMuted: "#aaaaaa"
+    property color mapGlassFill: Qt.rgba(0.04, 0.04, 0.04, 0.40)
+    property color mapGlassFillStrong: Qt.rgba(0.04, 0.04, 0.04, 0.52)
+    property color mapGlassBorder: Qt.rgba(1, 1, 1, 0.18)
     property int cardRadius: 18
     property int currentTab: 1
     property bool hasApp: typeof app !== "undefined" && app !== null
@@ -38,6 +41,8 @@ ApplicationWindow {
     property string toastTitle: "Notification"
     property string toastMessage: ""
     property var orbitSelection: []
+    property bool confirmPlanSheetVisible: false
+    property bool orbitSelectionSheetVisible: false
     property bool lastRouteEditMode: false
     property bool overlayActive: false
 
@@ -55,16 +60,28 @@ ApplicationWindow {
 
     function requestConfirmPlan() {
         if (!hasApp) return;
-        app.confirmPlan();
+        confirmPlanSheetVisible = true;
     }
 
     function requestOrbit() {
         if (!hasApp) return;
         if (app.confirmedObjectCount > 1) {
-            orbitSelectionDialog.open();
+            orbitSelection = [];
+            orbitSelectionSheetVisible = true;
         } else {
             app.orbitConfirmedObject();
         }
+    }
+
+    function toggleOrbitSelection(objectId) {
+        var next = orbitSelection.slice(0);
+        var idx = next.indexOf(objectId);
+        if (idx === -1) {
+            next.push(objectId);
+        } else {
+            next.splice(idx, 1);
+        }
+        orbitSelection = next;
     }
     Connections {
         target: hasApp ? app : null
@@ -81,6 +98,76 @@ ApplicationWindow {
             }
         }
     }
+
+    Component {
+        id: overlayActionButton
+
+        Item {
+            id: overlayActionButtonRoot
+            property string label
+            property var action
+            property bool accent: false
+            property bool hovered: false
+            property bool pressed: false
+
+            Layout.fillWidth: true
+            implicitHeight: 44
+            opacity: enabled ? 1.0 : 0.48
+            scale: pressed && enabled ? 0.985 : 1.0
+            clip: true
+            layer.enabled: true
+            layer.smooth: true
+            Behavior on scale { NumberAnimation { duration: 90; easing.type: Easing.OutQuad } }
+
+            Rectangle {
+                anchors.fill: parent
+                radius: 14
+                color: overlayActionButtonRoot.accent
+                       ? Qt.rgba(0.26, 0.58, 0.94, overlayActionButtonRoot.hovered ? 0.34 : 0.26)
+                       : Qt.rgba(1, 1, 1, overlayActionButtonRoot.hovered ? 0.12 : 0.07)
+                border.color: overlayActionButtonRoot.accent
+                              ? Qt.rgba(0.62, 0.83, 1.0, 0.56)
+                              : Qt.rgba(1, 1, 1, 0.12)
+                border.width: 1
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                radius: 14
+                gradient: Gradient {
+                    GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.12) }
+                    GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.03) }
+                }
+                opacity: overlayActionButtonRoot.pressed ? 0.18 : 0.1
+            }
+
+            Text {
+                anchors.centerIn: parent
+                text: overlayActionButtonRoot.label
+                color: overlayActionButtonRoot.accent ? "#eff7ff" : textPrimary
+                font.pixelSize: 13
+                font.family: "Inter"
+                font.bold: true
+            }
+
+            MouseArea {
+                anchors.fill: parent
+                enabled: overlayActionButtonRoot.enabled
+                hoverEnabled: true
+                onEntered: overlayActionButtonRoot.hovered = true
+                onExited: {
+                    overlayActionButtonRoot.hovered = false;
+                    overlayActionButtonRoot.pressed = false;
+                }
+                onPressed: overlayActionButtonRoot.pressed = true
+                onReleased: overlayActionButtonRoot.pressed = false
+                onClicked: {
+                    if (overlayActionButtonRoot.action) overlayActionButtonRoot.action();
+                }
+            }
+        }
+    }
+
     Item {
         id: sceneLayer
         anchors.fill: parent
@@ -99,6 +186,9 @@ ApplicationWindow {
             color: "transparent"
             z: 200
             clip: true
+            antialiasing: true
+            layer.enabled: true
+            layer.smooth: true
 
             ShaderEffectSource {
                 id: debugSlice
@@ -308,8 +398,8 @@ ApplicationWindow {
                             Rectangle {
                                 anchors.fill: parent
                                 radius: height / 2
-                                color: Qt.rgba(0.08, 0.08, 0.08, 0.35)
-                                border.color: Qt.rgba(1, 1, 1, 0.16)
+                                color: mapGlassFill
+                                border.color: mapGlassBorder
                                 border.width: 1
                                 z: -1
                             }
@@ -764,12 +854,54 @@ ApplicationWindow {
                                     }
                                 }
 
+                                ShaderEffectSource {
+                                    id: routeMenuSlice
+                                    anchors.fill: parent
+                                    sourceItem: mapView
+                                    sourceRect: Qt.rect(routeMenu.x, routeMenu.y, routeMenu.width, routeMenu.height)
+                                    recursive: true
+                                    live: root.currentTab === 1 && root.visible
+                                    visible: false
+                                }
+
+                                FastBlur {
+                                    id: routeMenuBlur
+                                    anchors.fill: parent
+                                    source: routeMenuSlice
+                                    radius: 20
+                                    transparentBorder: true
+                                    visible: root.currentTab === 1
+                                    z: -3
+                                }
+
+                                OpacityMask {
+                                    anchors.fill: parent
+                                    source: routeMenuBlur
+                                    maskSource: Rectangle {
+                                        width: routeMenu.width
+                                        height: routeMenu.height
+                                        radius: 12
+                                    }
+                                    z: -2
+                                }
+
                                 Rectangle {
                                     anchors.fill: parent
                                     radius: 12
-                                    color: Qt.rgba(0.08, 0.08, 0.08, 0.85)
-                                    border.color: Qt.rgba(1, 1, 1, 0.16)
+                                    color: mapGlassFillStrong
+                                    border.color: mapGlassBorder
                                     border.width: 1
+                                    z: -1
+                                }
+
+                                Rectangle {
+                                    anchors.fill: parent
+                                    radius: 12
+                                    gradient: Gradient {
+                                        GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.14) }
+                                        GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.04) }
+                                    }
+                                    opacity: 0.22
                                 }
 
                                 Column {
@@ -789,8 +921,8 @@ ApplicationWindow {
 
                                             Rectangle {
                                                 anchors.fill: parent
-                                                radius: 8
-                                                color: hovered ? Qt.rgba(1, 1, 1, 0.08) : "transparent"
+                                                radius: 10
+                                                color: hovered ? Qt.rgba(1, 1, 1, 0.10) : "transparent"
                                             }
 
                                             Text {
@@ -1349,8 +1481,8 @@ ApplicationWindow {
                                     Rectangle {
                                         anchors.fill: parent
                                         radius: 12
-                                        color: Qt.rgba(0.08, 0.08, 0.08, 0.35)
-                                        border.color: Qt.rgba(1, 1, 1, 0.16)
+                                        color: mapGlassFill
+                                        border.color: mapGlassBorder
                                         border.width: 1
                                         z: -1
                                     }
@@ -1437,8 +1569,8 @@ ApplicationWindow {
                                     Rectangle {
                                         anchors.fill: parent
                                         radius: 12
-                                        color: Qt.rgba(0.08, 0.08, 0.08, 0.35)
-                                        border.color: Qt.rgba(1, 1, 1, 0.16)
+                                        color: mapGlassFill
+                                        border.color: mapGlassBorder
                                         border.width: 1
                                         z: -1
                                     }
@@ -1492,12 +1624,54 @@ ApplicationWindow {
                                     }
                                 }
 
+                                ShaderEffectSource {
+                                    id: toolsMenuSlice
+                                    anchors.fill: parent
+                                    sourceItem: mapView
+                                    sourceRect: Qt.rect(toolsMenu.x, toolsMenu.y, toolsMenu.width, toolsMenu.height)
+                                    recursive: true
+                                    live: root.currentTab === 1 && root.visible
+                                    visible: false
+                                }
+
+                                FastBlur {
+                                    id: toolsMenuBlur
+                                    anchors.fill: parent
+                                    source: toolsMenuSlice
+                                    radius: 20
+                                    transparentBorder: true
+                                    visible: root.currentTab === 1
+                                    z: -3
+                                }
+
+                                OpacityMask {
+                                    anchors.fill: parent
+                                    source: toolsMenuBlur
+                                    maskSource: Rectangle {
+                                        width: toolsMenu.width
+                                        height: toolsMenu.height
+                                        radius: 12
+                                    }
+                                    z: -2
+                                }
+
                                 Rectangle {
                                     anchors.fill: parent
                                     radius: 12
-                                    color: Qt.rgba(0.08, 0.08, 0.08, 0.85)
-                                    border.color: Qt.rgba(1, 1, 1, 0.16)
+                                    color: mapGlassFillStrong
+                                    border.color: mapGlassBorder
                                     border.width: 1
+                                    z: -1
+                                }
+
+                                Rectangle {
+                                    anchors.fill: parent
+                                    radius: 12
+                                    gradient: Gradient {
+                                        GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.14) }
+                                        GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.04) }
+                                    }
+                                    opacity: 0.22
                                 }
 
                                 Column {
@@ -1517,8 +1691,8 @@ ApplicationWindow {
 
                                             Rectangle {
                                                 anchors.fill: parent
-                                                radius: 8
-                                                color: hovered ? Qt.rgba(1, 1, 1, 0.08) : "transparent"
+                                                radius: 10
+                                                color: hovered ? Qt.rgba(1, 1, 1, 0.10) : "transparent"
                                             }
 
                                             Text {
@@ -1558,40 +1732,13 @@ ApplicationWindow {
                                     Loader {
                                         sourceComponent: toolsMenuItem
                                         onLoaded: {
-                                            item.label = "Set target"
-                                            item.action = function() { mapHud.runTool("drawTarget"); }
+                                            item.label = "Remove"
+                                            item.action = function() { mapHud.runTool("setRemoveMode", true); }
                                         }
                                     }
                                     Loader {
                                         sourceComponent: toolsMenuItem
-                                        onLoaded: {
-                                            item.label = "Clear path"
-                                            item.action = function() { mapHud.runTool("clearPath"); }
-                                        }
-                                    }
-                                    Loader {
-                                        sourceComponent: toolsMenuItem
-                                        onLoaded: {
-                                            item.label = "Remove last point"
-                                            item.action = function() { mapHud.runTool("removeLastPoint"); }
-                                        }
-                                    }
-                                    Loader {
-                                        sourceComponent: toolsMenuItem
-                                        onLoaded: {
-                                            item.label = "Clear target"
-                                            item.action = function() { mapHud.runTool("clearTarget"); }
-                                        }
-                                    }
-                                    Loader {
-                                        sourceComponent: toolsMenuItem
-                                        onLoaded: {
-                                            item.label = "Reset view"
-                                            item.action = function() { mapHud.runTool("resetView"); }
-                                        }
-                                    }
-                                    Loader {
-                                        sourceComponent: toolsMenuItem
+                                        active: root.isPreflight || root.isReady
                                         onLoaded: {
                                             item.label = "Set home"
                                             item.action = function() { if (hasApp) app.startHomePickMode(); }
@@ -1600,15 +1747,8 @@ ApplicationWindow {
                                     Loader {
                                         sourceComponent: toolsMenuItem
                                         onLoaded: {
-                                            item.label = "Clear home"
-                                            item.action = function() { if (hasApp) app.clearHomeLocation(); }
-                                        }
-                                    }
-                                    Loader {
-                                        sourceComponent: toolsMenuItem
-                                        onLoaded: {
-                                            item.label = "Manual target"
-                                            item.action = function() { if (hasApp) app.startManualTargetMode(); }
+                                            item.label = "Reset view"
+                                            item.action = function() { mapHud.runTool("resetView"); }
                                         }
                                     }
                                 }
@@ -1680,7 +1820,7 @@ ApplicationWindow {
                                     source: autoOrbitTriggerSlice
                                     radius: 16
                                     transparentBorder: true
-                                    visible: false
+                                    visible: root.currentTab === 1
                                     z: -3
                                 }
 
@@ -1698,8 +1838,8 @@ ApplicationWindow {
                                 Rectangle {
                                     anchors.fill: parent
                                     radius: height / 2
-                                    color: Qt.rgba(0.08, 0.08, 0.08, 0.42)
-                                    border.color: Qt.rgba(1, 1, 1, 0.16)
+                                    color: mapGlassFill
+                                    border.color: mapGlassBorder
                                     border.width: 1
                                     z: -1
                                 }
@@ -1814,7 +1954,7 @@ ApplicationWindow {
                                     source: autoOrbitMenuSlice
                                     radius: 18
                                     transparentBorder: true
-                                    visible: false
+                                    visible: root.currentTab === 1
                                     z: -3
                                 }
 
@@ -1832,8 +1972,8 @@ ApplicationWindow {
                                 Rectangle {
                                     anchors.fill: parent
                                     radius: 16
-                                    color: Qt.rgba(0.08, 0.08, 0.08, 0.48)
-                                    border.color: Qt.rgba(1, 1, 1, 0.16)
+                                    color: mapGlassFillStrong
+                                    border.color: mapGlassBorder
                                     border.width: 1
                                     z: -1
                                 }
@@ -1905,7 +2045,9 @@ ApplicationWindow {
                         Rectangle {
                             anchors.fill: parent
                             radius: cardRadius
-                            color: Qt.rgba(0, 0, 0, 0.55)
+                            color: Qt.rgba(0.02, 0.02, 0.02, 0.44)
+                            border.color: Qt.rgba(1, 1, 1, 0.08)
+                            border.width: 1
                             visible: mapOverlay.text !== ""
                             z: 5
                             Text {
@@ -2089,85 +2231,810 @@ ApplicationWindow {
         }
     }
 
-    MessageDialog {
-        id: confirmPlanDialog
-        title: "Confirm plan"
-        text: "Are you sure you want to accept the plan?"
-        buttons: MessageDialog.Yes | MessageDialog.No
-        onAccepted: {
-            if (!hasApp) return;
-            app.confirmPlan();
+    Item {
+        id: confirmPlanSheet
+        anchors.fill: parent
+        visible: confirmPlanSheetVisible
+        opacity: confirmPlanSheetVisible ? 1 : 0
+        z: 139
+
+        Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutQuad } }
+
+        Rectangle {
+            anchors.fill: parent
+            color: Qt.rgba(0, 0, 0, 0.42)
+        }
+
+        Item {
+            width: Math.min(parent.width - 48, 480)
+            anchors.centerIn: parent
+            implicitHeight: confirmPlanColumn.implicitHeight + 44
+
+            ShaderEffectSource {
+                id: confirmPlanSlice
+                anchors.fill: parent
+                sourceItem: sceneLayer
+                sourceRect: Qt.rect(parent.x, parent.y, parent.width, parent.height)
+                recursive: true
+                live: root.visible
+                visible: false
+            }
+
+            FastBlur {
+                id: confirmPlanBlur
+                anchors.fill: parent
+                source: confirmPlanSlice
+                radius: 20
+                transparentBorder: true
+                z: -3
+            }
+
+            OpacityMask {
+                anchors.fill: parent
+                source: confirmPlanBlur
+                maskSource: Rectangle {
+                    width: confirmPlanBlur.width
+                    height: confirmPlanBlur.height
+                    radius: 24
+                }
+                z: -2
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                radius: 24
+                color: Qt.rgba(0.08, 0.08, 0.08, 0.56)
+                border.color: Qt.rgba(1, 1, 1, 0.18)
+                border.width: 1
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                radius: 24
+                gradient: Gradient {
+                    GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.14) }
+                    GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.05) }
+                }
+                opacity: 0.22
+            }
+
+            ColumnLayout {
+                id: confirmPlanColumn
+                anchors.fill: parent
+                anchors.margins: 22
+                spacing: 14
+
+                Text {
+                    text: hasApp && app.currentBackend === "unreal" ? "Confirm route and start flight" : "Confirm plan"
+                    color: textPrimary
+                    font.pixelSize: 20
+                    font.family: "Inter"
+                    font.bold: true
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: hasApp && app.currentBackend === "unreal"
+                          ? "The mission route will be accepted and the drone will switch into flight mode immediately."
+                          : "Accept the current route and lock it as the active mission plan."
+                    color: textMuted
+                    font.pixelSize: 12
+                    font.family: "Inter"
+                    wrapMode: Text.WordWrap
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    Loader {
+                        Layout.fillWidth: true
+                        sourceComponent: overlayActionButton
+                        onLoaded: {
+                            item.label = "Cancel"
+                            item.action = function() { confirmPlanSheetVisible = false; }
+                        }
+                    }
+
+                    Loader {
+                        Layout.fillWidth: true
+                        sourceComponent: overlayActionButton
+                        onLoaded: {
+                            item.label = hasApp && app.currentBackend === "unreal" ? "Confirm and fly" : "Confirm plan"
+                            item.accent = true
+                            item.action = function() {
+                                confirmPlanSheetVisible = false;
+                                if (hasApp) app.confirmPlan();
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-    Dialog {
-        id: orbitSelectionDialog
-        title: "Select targets"
-        modal: true
-        standardButtons: Dialog.Ok | Dialog.Cancel
-        onOpened: orbitSelection = []
-        onAccepted: {
-            if (!hasApp) return;
-            app.orbitSelectedObjects(orbitSelection);
+    Item {
+        id: routeBatterySheet
+        anchors.fill: parent
+        visible: hasApp && app.routeBatteryAdvisoryVisible
+        opacity: visible ? 1 : 0
+        z: 141
+
+        Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutQuad } }
+
+        Rectangle {
+            anchors.fill: parent
+            color: Qt.rgba(0, 0, 0, 0.42)
         }
-        onRejected: orbitSelection = []
 
-        contentItem: Column {
-            spacing: 8
-            width: 360
+        Item {
+            width: Math.min(parent.width - 48, 520)
+            anchors.centerIn: parent
+            implicitHeight: routeBatteryColumn.implicitHeight + 44
 
-            Text {
-                text: "Pick one or more objects to orbit."
-                color: textMuted
-                font.pixelSize: 12
-                font.family: "Inter"
-                wrapMode: Text.WordWrap
+            ShaderEffectSource {
+                id: routeBatterySlice
+                anchors.fill: parent
+                sourceItem: sceneLayer
+                sourceRect: Qt.rect(parent.x, parent.y, parent.width, parent.height)
+                recursive: true
+                live: root.visible
+                visible: false
             }
 
-            ListView {
-                id: orbitList
-                width: parent.width
-                height: Math.min(240, contentHeight)
-                clip: true
-                model: hasApp ? app.confirmedObjects : []
-                delegate: Item {
-                    width: orbitList.width
-                    height: 36
-                    property string objectId: modelData.object_id
+            FastBlur {
+                id: routeBatteryBlur
+                anchors.fill: parent
+                source: routeBatterySlice
+                radius: 20
+                transparentBorder: true
+                z: -3
+            }
 
-                    Row {
-                        anchors.fill: parent
-                        anchors.margins: 4
-                        spacing: 10
+            OpacityMask {
+                anchors.fill: parent
+                source: routeBatteryBlur
+                maskSource: Rectangle {
+                    width: routeBatteryBlur.width
+                    height: routeBatteryBlur.height
+                    radius: 24
+                }
+                z: -2
+            }
 
-                        CheckBox {
-                            id: orbitCheck
-                            checked: orbitSelection.indexOf(objectId) !== -1
-                            onToggled: {
-                                var idx = orbitSelection.indexOf(objectId);
-                                if (checked && idx === -1) {
-                                    orbitSelection.push(objectId);
-                                } else if (!checked && idx !== -1) {
-                                    orbitSelection.splice(idx, 1);
+            Rectangle {
+                anchors.fill: parent
+                radius: 24
+                color: Qt.rgba(0.08, 0.08, 0.08, 0.56)
+                border.color: Qt.rgba(1, 1, 1, 0.18)
+                border.width: 1
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                radius: 24
+                gradient: Gradient {
+                    GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.14) }
+                    GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.05) }
+                }
+                opacity: 0.22
+            }
+
+            ColumnLayout {
+                id: routeBatteryColumn
+                anchors.fill: parent
+                anchors.margins: 22
+                spacing: 14
+
+                Text {
+                    text: "Route battery warning"
+                    color: textPrimary
+                    font.pixelSize: 20
+                    font.family: "Inter"
+                    font.bold: true
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: hasApp ? app.routeBatteryAdvisoryText : ""
+                    color: textMuted
+                    font.pixelSize: 12
+                    font.family: "Inter"
+                    wrapMode: Text.WordWrap
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    Loader {
+                        Layout.fillWidth: true
+                        sourceComponent: overlayActionButton
+                        onLoaded: {
+                            item.label = "Cancel"
+                            item.action = function() { if (hasApp) app.respondRouteBatteryAdvisory("cancel"); }
+                        }
+                    }
+
+                    Loader {
+                        Layout.fillWidth: true
+                        sourceComponent: overlayActionButton
+                        onLoaded: {
+                            item.label = "Return home"
+                            item.accent = true
+                            item.enabled = Qt.binding(function() { return hasApp ? app.routeBatteryReturnHomeAvailable : false; })
+                            item.action = function() { if (hasApp) app.respondRouteBatteryAdvisory("rtl"); }
+                        }
+                    }
+
+                    Loader {
+                        Layout.fillWidth: true
+                        sourceComponent: overlayActionButton
+                        onLoaded: {
+                            item.label = "Proceed anyway"
+                            item.action = function() { if (hasApp) app.respondRouteBatteryAdvisory("proceed"); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Item {
+        id: orbitBatterySheet
+        anchors.fill: parent
+        visible: hasApp && app.orbitBatteryAdvisoryVisible
+        opacity: visible ? 1 : 0
+        z: 142
+
+        Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutQuad } }
+
+        Rectangle {
+            anchors.fill: parent
+            color: Qt.rgba(0, 0, 0, 0.42)
+        }
+
+        Item {
+            width: Math.min(parent.width - 48, 520)
+            anchors.centerIn: parent
+            implicitHeight: orbitBatteryColumn.implicitHeight + 44
+
+            ShaderEffectSource {
+                id: orbitBatterySlice
+                anchors.fill: parent
+                sourceItem: sceneLayer
+                sourceRect: Qt.rect(parent.x, parent.y, parent.width, parent.height)
+                recursive: true
+                live: root.visible
+                visible: false
+            }
+
+            FastBlur {
+                id: orbitBatteryBlur
+                anchors.fill: parent
+                source: orbitBatterySlice
+                radius: 20
+                transparentBorder: true
+                z: -3
+            }
+
+            OpacityMask {
+                anchors.fill: parent
+                source: orbitBatteryBlur
+                maskSource: Rectangle {
+                    width: orbitBatteryBlur.width
+                    height: orbitBatteryBlur.height
+                    radius: 24
+                }
+                z: -2
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                radius: 24
+                color: Qt.rgba(0.08, 0.08, 0.08, 0.56)
+                border.color: Qt.rgba(1, 1, 1, 0.18)
+                border.width: 1
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                radius: 24
+                gradient: Gradient {
+                    GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.14) }
+                    GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.05) }
+                }
+                opacity: 0.22
+            }
+
+            ColumnLayout {
+                id: orbitBatteryColumn
+                anchors.fill: parent
+                anchors.margins: 22
+                spacing: 14
+
+                Text {
+                    text: "Orbit battery warning"
+                    color: textPrimary
+                    font.pixelSize: 20
+                    font.family: "Inter"
+                    font.bold: true
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: hasApp ? app.orbitBatteryAdvisoryText : ""
+                    color: textMuted
+                    font.pixelSize: 12
+                    font.family: "Inter"
+                    wrapMode: Text.WordWrap
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    Loader {
+                        Layout.fillWidth: true
+                        sourceComponent: overlayActionButton
+                        onLoaded: {
+                            item.label = "Cancel orbit"
+                            item.action = function() { if (hasApp) app.respondOrbitBatteryAdvisory("cancel"); }
+                        }
+                    }
+
+                    Loader {
+                        Layout.fillWidth: true
+                        sourceComponent: overlayActionButton
+                        onLoaded: {
+                            item.label = "Return home"
+                            item.accent = true
+                            item.enabled = Qt.binding(function() { return hasApp ? app.orbitBatteryReturnHomeAvailable : false; })
+                            item.action = function() { if (hasApp) app.respondOrbitBatteryAdvisory("rtl"); }
+                        }
+                    }
+
+                    Loader {
+                        Layout.fillWidth: true
+                        sourceComponent: overlayActionButton
+                        onLoaded: {
+                            item.label = "Proceed anyway"
+                            item.action = function() { if (hasApp) app.respondOrbitBatteryAdvisory("proceed"); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Item {
+        id: orbitSelectionSheet
+        anchors.fill: parent
+        visible: orbitSelectionSheetVisible
+        opacity: orbitSelectionSheetVisible ? 1 : 0
+        z: 140
+
+        Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutQuad } }
+
+        Rectangle {
+            anchors.fill: parent
+            color: Qt.rgba(0, 0, 0, 0.42)
+        }
+
+        Item {
+            width: Math.min(parent.width - 48, 520)
+            height: Math.min(parent.height - 96, 560)
+            anchors.centerIn: parent
+
+            ShaderEffectSource {
+                id: orbitSheetSlice
+                anchors.fill: parent
+                sourceItem: sceneLayer
+                sourceRect: Qt.rect(parent.x, parent.y, parent.width, parent.height)
+                recursive: true
+                live: root.visible
+                visible: false
+            }
+
+            FastBlur {
+                id: orbitSheetBlur
+                anchors.fill: parent
+                source: orbitSheetSlice
+                radius: 22
+                transparentBorder: true
+                z: -3
+            }
+
+            OpacityMask {
+                anchors.fill: parent
+                source: orbitSheetBlur
+                maskSource: Rectangle {
+                    width: orbitSelectionCard.width
+                    height: orbitSelectionCard.height
+                    radius: 26
+                }
+                z: -2
+            }
+
+            Rectangle {
+                id: orbitSelectionCard
+                anchors.fill: parent
+                radius: 26
+                color: Qt.rgba(0.08, 0.08, 0.08, 0.54)
+                border.color: Qt.rgba(1, 1, 1, 0.18)
+                border.width: 1
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                radius: orbitSelectionCard.radius
+                gradient: Gradient {
+                    GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.14) }
+                    GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.05) }
+                }
+                opacity: 0.24
+            }
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 22
+                spacing: 14
+
+                Text {
+                    text: "Orbit target selection"
+                    color: textPrimary
+                    font.pixelSize: 22
+                    font.family: "Inter"
+                    font.bold: true
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: "Pick one or more confirmed targets. The same numbers are shown on the map markers."
+                    color: textMuted
+                    font.pixelSize: 12
+                    font.family: "Inter"
+                    wrapMode: Text.WordWrap
+                }
+
+                Component {
+                    id: orbitSheetActionButton
+
+                    Item {
+                        id: orbitSheetActionButtonRoot
+                        property string label
+                        property var action
+                        property bool accent: false
+                        property bool hovered: false
+                        property bool pressed: false
+
+                        Layout.fillWidth: true
+                        implicitHeight: 44
+                        opacity: enabled ? 1.0 : 0.48
+                        scale: pressed && enabled ? 0.985 : 1.0
+                        Behavior on scale { NumberAnimation { duration: 90; easing.type: Easing.OutQuad } }
+
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: height / 2
+                            color: orbitSheetActionButtonRoot.accent
+                                   ? (orbitSheetActionButtonRoot.pressed ? Qt.rgba(0.20, 0.48, 0.78, 0.40)
+                                                                         : Qt.rgba(0.12, 0.32, 0.52, 0.28))
+                                   : (orbitSheetActionButtonRoot.pressed ? Qt.rgba(1, 1, 1, 0.16)
+                                                                         : Qt.rgba(1, 1, 1, 0.09))
+                            border.width: 1
+                            border.color: orbitSheetActionButtonRoot.accent
+                                          ? Qt.rgba(0.62, 0.84, 1, orbitSheetActionButtonRoot.hovered ? 0.54 : 0.36)
+                                          : Qt.rgba(1, 1, 1, orbitSheetActionButtonRoot.hovered ? 0.28 : 0.18)
+                            Behavior on color { ColorAnimation { duration: 120 } }
+                            Behavior on border.color { ColorAnimation { duration: 120 } }
+                        }
+
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: height / 2
+                            gradient: Gradient {
+                                GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, orbitSheetActionButtonRoot.hovered ? 0.20 : 0.14) }
+                                GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.04) }
+                            }
+                        }
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: orbitSheetActionButtonRoot.label
+                            color: orbitSheetActionButtonRoot.accent ? "#dff1ff" : textPrimary
+                            font.pixelSize: 13
+                            font.family: "Inter"
+                            font.bold: orbitSheetActionButtonRoot.hovered || orbitSheetActionButtonRoot.pressed
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            enabled: orbitSheetActionButtonRoot.enabled
+                            hoverEnabled: orbitSheetActionButtonRoot.enabled
+                            cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                            onEntered: orbitSheetActionButtonRoot.hovered = true
+                            onExited: {
+                                orbitSheetActionButtonRoot.hovered = false
+                                orbitSheetActionButtonRoot.pressed = false
+                            }
+                            onPressed: orbitSheetActionButtonRoot.pressed = true
+                            onCanceled: orbitSheetActionButtonRoot.pressed = false
+                            onReleased: {
+                                if (orbitSheetActionButtonRoot.pressed && containsMouse && orbitSheetActionButtonRoot.action) {
+                                    orbitSheetActionButtonRoot.action()
+                                }
+                                orbitSheetActionButtonRoot.pressed = false
+                            }
+                        }
+                    }
+                }
+
+                ListView {
+                    id: orbitList
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    spacing: 10
+                    model: hasApp ? app.confirmedObjects : []
+                    delegate: Rectangle {
+                        property bool selected: orbitSelection.indexOf(modelData.object_id) !== -1
+                        property bool hovered: false
+                        width: orbitList.width
+                        height: 84
+                        radius: 18
+                        color: selected ? Qt.rgba(1, 1, 1, 0.14) : (hovered ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(0.08, 0.08, 0.08, 0.26))
+                        border.color: selected ? Qt.rgba(1, 1, 1, 0.24) : Qt.rgba(1, 1, 1, hovered ? 0.16 : 0.10)
+                        border.width: 1
+                        Behavior on color { ColorAnimation { duration: 120 } }
+                        Behavior on border.color { ColorAnimation { duration: 120 } }
+
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: parent.radius
+                            color: "transparent"
+                            border.width: selected ? 1 : 0
+                            border.color: Qt.rgba(0.62, 0.84, 1, 0.28)
+                        }
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.margins: 14
+                            spacing: 14
+
+                            Rectangle {
+                                width: 34
+                                height: 34
+                                radius: 17
+                                color: "#ffffff"
+                                border.color: "#000000"
+                                border.width: 2
+                                Layout.alignment: Qt.AlignVCenter
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: modelData.display_index
+                                    color: "#000000"
+                                    font.pixelSize: 13
+                                    font.family: "Inter"
+                                    font.bold: true
+                                }
+                            }
+
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 4
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: "#" + modelData.object_id
+                                    color: textPrimary
+                                    font.pixelSize: 14
+                                    font.family: "Inter"
+                                    font.bold: true
+                                    elide: Text.ElideRight
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: "Class " + modelData.class_id + "  Confidence " + (modelData.confidence * 100).toFixed(1) + "%"
+                                    color: textMuted
+                                    font.pixelSize: 11
+                                    font.family: "Inter"
+                                    elide: Text.ElideRight
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: "Lat " + Number(modelData.lat).toFixed(5) + "  Lon " + Number(modelData.lon).toFixed(5)
+                                    color: textMuted
+                                    font.pixelSize: 11
+                                    font.family: "Inter"
+                                    elide: Text.ElideRight
+                                }
+                            }
+
+                            Rectangle {
+                                width: 24
+                                height: 24
+                                radius: 8
+                                Layout.alignment: Qt.AlignVCenter
+                                color: selected ? "#1581df" : Qt.rgba(1, 1, 1, 0.08)
+                                border.width: 1
+                                border.color: selected ? Qt.rgba(0.80, 0.92, 1, 0.68) : Qt.rgba(1, 1, 1, 0.24)
+                                Rectangle {
+                                    anchors.centerIn: parent
+                                    width: 10
+                                    height: 10
+                                    radius: 3
+                                    color: "#ffffff"
+                                    visible: selected
+                                }
+                                Rectangle {
+                                    anchors.fill: parent
+                                    radius: parent.radius
+                                    color: "transparent"
+                                    border.width: selected ? 1 : 0
+                                    border.color: Qt.rgba(1, 1, 1, 0.18)
                                 }
                             }
                         }
 
-                        Column {
-                            spacing: 2
-                            Text {
-                                text: "#" + objectId
-                                color: textPrimary
-                                font.pixelSize: 12
-                                font.family: "Inter"
-                            }
-                            Text {
-                                text: "Class: " + modelData.class_id + "  Conf: " + (modelData.confidence * 100).toFixed(1) + "%"
-                                color: textMuted
-                                font.pixelSize: 10
-                                font.family: "Inter"
+                        MouseArea {
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onEntered: parent.hovered = true
+                            onExited: parent.hovered = false
+                            onClicked: {
+                                if (hasApp) {
+                                    app.selectConfirmedObject(modelData.object_id);
+                                }
+                                toggleOrbitSelection(modelData.object_id);
                             }
                         }
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    Loader {
+                        Layout.fillWidth: true
+                        sourceComponent: orbitSheetActionButton
+                        onLoaded: {
+                            item.label = "Cancel"
+                            item.action = function() {
+                                orbitSelectionSheetVisible = false
+                                orbitSelection = []
+                            }
+                        }
+                    }
+
+                    Loader {
+                        Layout.fillWidth: true
+                        sourceComponent: orbitSheetActionButton
+                        onLoaded: {
+                            item.label = "Orbit selected"
+                            item.accent = true
+                            item.enabled = Qt.binding(function() { return orbitSelection.length > 0; })
+                            item.action = function() {
+                                if (!hasApp) return;
+                                app.orbitSelectedObjects(orbitSelection);
+                                orbitSelectionSheetVisible = false;
+                                orbitSelection = [];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Item {
+        id: recoverableMissionSheet
+        anchors.fill: parent
+        visible: hasApp && app.recoverableMissionAvailable && app.currentBackend === "unreal" && app.unrealRuntimeStatus !== "disconnected"
+        opacity: visible ? 1 : 0
+        z: 135
+
+        Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutQuad } }
+
+        Rectangle {
+            anchors.fill: parent
+            color: Qt.rgba(0, 0, 0, 0.22)
+        }
+
+        Item {
+            width: Math.min(parent.width - 64, 480)
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.top: parent.top
+            anchors.topMargin: 72
+            implicitHeight: recoverableMissionColumn.implicitHeight + 28
+
+            ShaderEffectSource {
+                id: recoverableMissionSlice
+                anchors.fill: parent
+                sourceItem: sceneLayer
+                sourceRect: Qt.rect(parent.x, parent.y, parent.width, parent.height)
+                recursive: true
+                live: root.visible
+                visible: false
+            }
+
+            FastBlur {
+                id: recoverableMissionBlur
+                anchors.fill: parent
+                source: recoverableMissionSlice
+                radius: 20
+                transparentBorder: true
+                z: -3
+            }
+
+            OpacityMask {
+                anchors.fill: parent
+                source: recoverableMissionBlur
+                maskSource: Rectangle {
+                    width: recoverableMissionBlur.width
+                    height: recoverableMissionBlur.height
+                    radius: 24
+                }
+                z: -2
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                radius: 24
+                color: Qt.rgba(0.08, 0.08, 0.08, 0.56)
+                border.color: Qt.rgba(1, 1, 1, 0.18)
+                border.width: 1
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                radius: 24
+                gradient: Gradient {
+                    GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.14) }
+                    GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.05) }
+                }
+                opacity: 0.22
+            }
+
+            ColumnLayout {
+                id: recoverableMissionColumn
+                anchors.fill: parent
+                anchors.margins: 18
+                spacing: 12
+
+                Text {
+                    text: "Unreal session interrupted"
+                    color: textPrimary
+                    font.pixelSize: 18
+                    font.family: "Inter"
+                    font.bold: true
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: hasApp ? app.recoverableMissionText : ""
+                    color: textMuted
+                    font.pixelSize: 12
+                    font.family: "Inter"
+                    wrapMode: Text.WordWrap
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    Button {
+                        Layout.fillWidth: true
+                        text: "Discard"
+                        onClicked: if (hasApp) app.discardRecoverableMission()
+                    }
+
+                    Button {
+                        Layout.fillWidth: true
+                        text: "Restore route"
+                        onClicked: if (hasApp) app.restoreRecoverableMission()
                     }
                 }
             }
@@ -2331,7 +3198,7 @@ ApplicationWindow {
             source: updateMapSlice
             radius: 16
             transparentBorder: true
-            visible: false
+            visible: updateMapFloating.plannerActive
             z: -3
         }
 
@@ -2349,8 +3216,8 @@ ApplicationWindow {
         Rectangle {
             anchors.fill: parent
             radius: height / 2
-            color: Qt.rgba(0.08, 0.08, 0.08, 0.42)
-            border.color: Qt.rgba(1, 1, 1, 0.18)
+            color: mapGlassFill
+            border.color: mapGlassBorder
             border.width: 1
             z: -1
         }
@@ -2364,30 +3231,6 @@ ApplicationWindow {
             }
             opacity: updateMapMouse.containsMouse ? 0.30 : 0.18
             Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
-        }
-
-        Rectangle {
-            width: parent.width - 44
-            height: 10
-            radius: 5
-            anchors.horizontalCenter: parent.horizontalCenter
-            anchors.bottom: parent.bottom
-            anchors.bottomMargin: -5
-            color: Qt.rgba(0.08, 0.08, 0.08, 0.18)
-            border.color: "transparent"
-            z: -4
-        }
-
-        Rectangle {
-            width: parent.width - 36
-            height: 8
-            radius: 4
-            anchors.horizontalCenter: parent.horizontalCenter
-            anchors.bottom: parent.bottom
-            anchors.bottomMargin: -4
-            color: Qt.rgba(0.08, 0.08, 0.08, 0.42)
-            border.color: "transparent"
-            z: 1
         }
 
         Text {

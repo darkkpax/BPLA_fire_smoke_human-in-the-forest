@@ -10,6 +10,7 @@ import time
 import uuid
 import os
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 from enum import StrEnum
@@ -37,6 +38,8 @@ from fire_uav.gui.viewmodels.detector_vm import DetectorVM
 from fire_uav.gui.viewmodels.planner_vm import PlannerVM
 from fire_uav.module_core.factories import build_camera_params, get_energy_model
 from fire_uav.module_core.geometry import haversine_m
+from fire_uav.module_core.route.maneuvers import build_rejoin
+from fire_uav.module_core.route.base_location import resolve_base_location
 from fire_uav.module_core.drivers.registry import resolve_driver_type
 from fire_uav.module_core.detections.pipeline import (
     DetectionBatchPayload,
@@ -49,15 +52,21 @@ from fire_uav.domain.video.camera import CameraParams
 from fire_uav.gui.services.unreal_link_service import UnrealLinkService
 from fire_uav.services.components.camera import CameraThread
 from fire_uav.services.bus import Event, bus
+from fire_uav.services.detection_exports import (
+    make_confirmed_detection_log_entry,
+    make_raw_detection_log_entry,
+)
 from fire_uav.services.debug_sim import DebugSimulationService
 from fire_uav.services.flight_recorder import FlightRecorder, FlightSummary
 from fire_uav.services.mission import CameraMonitor, CameraStatus, LinkMonitor, LinkStatus, MissionState, MissionStateMachine
 from fire_uav.services.mission.action_policy import MissionActionPolicy
 from fire_uav.services.mission.active_path import ActivePathController, ActivePathMode
+from fire_uav.services.mission.route_edit import dedupe_path, split_route_for_edit
 from fire_uav.services.notifications import ToastDeduplicator
 from fire_uav.services.objects_store import ConfirmedObject, ConfirmedObjectsStore
 from fire_uav.services.targets.target_tracker import TargetObservation, TargetTracker
 from fire_uav.services.ui_throttle import TelemetryStore
+from fire_uav.utils.time import utc_iso_z, utc_now
 
 _log: Final = logging.getLogger(__name__)
 
@@ -67,6 +76,14 @@ class OrbitFlowState(StrEnum):
     TARGET_DETECTED_REACTION_WINDOW = "target_detected_reaction_window"
     ORBIT_ACTIVE = "orbit_active"
     ROUTE_RESUME = "route_resume"
+
+
+@dataclass(slots=True)
+class RecoverableMissionSnapshot:
+    path: list[tuple[float, float]]
+    home: dict[str, float] | None
+    confirmed_objects: list[dict[str, object]]
+    selected_object_id: str | None
 
 
 # --------------------------------------------------------------------------- #
@@ -140,6 +157,10 @@ class VideoBridge(QObject):
             return
         self._last_qimage = image.copy()
         self._last_frame = None
+        self._render()
+
+    def clear_overlays(self) -> None:
+        self._bboxes = []
         self._render()
 
     # ---------- internal ---------- #
@@ -269,6 +290,7 @@ class MapBridge(QObject):
     def __init__(self, vm: PlannerVM, provider: MapProvider | None = None) -> None:
         super().__init__()
         self._vm = vm
+        self._path_provider: Callable[[], list[tuple[float, float]]] | None = None
         cache_dir = Path(__file__).resolve().parents[2] / "data" / "cache" / "tiles"
         self._default_cache_dir = cache_dir
         self._provider: MapProvider = provider or self._select_provider()
@@ -301,8 +323,11 @@ class MapBridge(QObject):
             return
         self._render_timer.start()
 
+    def set_path_provider(self, provider: Callable[[], list[tuple[float, float]]] | None) -> None:
+        self._path_provider = provider
+
     def _render_map_now(self) -> None:
-        path = self._vm.get_active_path()
+        path = self._path_provider() if self._path_provider is not None else self._vm.get_active_path()
         self._map_path = self._provider.render_map(path, self._token)
         self._token += 1
         self._last_render_ts = time.monotonic()
@@ -621,11 +646,13 @@ class AppController(QObject):
     cameraStatusDetailChanged = Signal()
     statsChanged = Signal()
     debugModeChanged = Signal()
+    debugDetectorOrbitGuardChanged = Signal()
     simCameraEnabledChanged = Signal()
     bridgeModeChanged = Signal()
     bridgeBatteryProfileChanged = Signal()
     unsafeStartChanged = Signal()
     routeBatteryChanged = Signal()
+    routeBatteryAdvisoryChanged = Signal()
     confirmedObjectsChanged = Signal()
     missionStateChanged = Signal()
     planConfirmedChanged = Signal()
@@ -641,6 +668,8 @@ class AppController(QObject):
     unrealVideoModeChanged = Signal()
     autoOrbitEnabledChanged = Signal()
     orbitRadiusMChanged = Signal()
+    recoverableMissionChanged = Signal()
+    orbitBatteryAdvisoryChanged = Signal()
 
     def __init__(
         self,
@@ -673,6 +702,9 @@ class AppController(QObject):
         self._det_json_path = Path(getattr(settings, "output_root", Path("data/outputs"))) / (
             "detections.jsonl"
         )
+        self._confirmed_det_json_path = Path(
+            getattr(settings, "output_root", Path("data/outputs"))
+        ) / "confirmed_detections.jsonl"
         self._log_history_path = (
             Path(__file__).resolve().parents[3] / "data" / "artifacts" / "logs" / "fire_uav_debug.log"
         )
@@ -704,6 +736,7 @@ class AppController(QObject):
         self._staged_plan: list[tuple[float, float]] | None = None
         self._route_edit_anchor: tuple[float, float] | None = None
         self._route_edit_original_plan: list[tuple[float, float]] | None = None
+        self._route_edit_locked_path: list[tuple[float, float]] | None = None
         self._latest_telemetry: TelemetrySample | None = None
         self._uav_states: dict[str, UavState] = {}
         self._telemetry_store = TelemetryStore()
@@ -737,12 +770,21 @@ class AppController(QObject):
         self._pending_orbit_queue: list[tuple[str, str]] = []
         self._pending_orbit_ids: set[str] = set()
         self._last_orbit_availability: tuple[bool, bool] | None = None
+        setattr(deps, "route_edit_anchor", None)
+        setattr(deps, "route_edit_preview_path", None)
+        setattr(deps, "route_edit_locked_path", None)
+        setattr(deps, "debug_orbit_preview_paths", [])
         self._orbit_active = False
         self._orbit_rejoin_wp: Waypoint | None = None
         self._orbit_rejoin_close_hits = 0
         self._orbit_rejoin_threshold_m = float(getattr(settings, "orbit_rejoin_threshold_m", 15.0) or 15.0)
         self._orbit_target_track_ids: set[int] = set()
         self._orbit_target_centers: list[tuple[float, float]] = []
+        self._orbit_route_end_wp: Waypoint | None = None
+        self._orbit_resume_route: Route | None = None
+        self._orbit_resume_min_index: int | None = None
+        self._orbit_started_monotonic = 0.0
+        self._orbit_min_complete_time_s = 0.0
         self._route_complete_announced = False
         self._debug_sim: DebugSimulationService | None = None
         self._rtl_forced = False
@@ -786,7 +828,16 @@ class AppController(QObject):
         self._unreal_local_first_confirmed_logged = False
         self._unreal_local_telemetry_by_frame_id: dict[str, TelemetrySample] = {}
         self._unreal_local_frame_order: deque[str] = deque()
+        self._debug_disable_detector_during_orbit = bool(
+            getattr(settings, "debug_disable_detector_during_orbit", False)
+        )
+        self._detector_forced_paused_by_orbit = False
+        self._recoverable_mission: RecoverableMissionSnapshot | None = None
         self._unreal_status = "disconnected"
+        self._last_unreal_route_sent_monotonic = 0.0
+        self._unreal_waiting_route_grace_s = float(
+            getattr(settings, "unreal_waiting_route_grace_s", 2.5) or 2.5
+        )
         self._unreal_video_mode = str(
             getattr(settings, "unreal_video_mode", "h264_stream") or "h264_stream"
         ).lower()
@@ -794,6 +845,19 @@ class AppController(QObject):
         self._route_battery_text = "Route: --"
         self._route_battery_remaining_text = "Remaining: --"
         self._route_battery_warning = False
+        self._route_battery_advisory_visible = False
+        self._route_battery_advisory_text = ""
+        self._route_battery_rtl_available = False
+        self._pending_route_battery_action = ""
+        self._pending_route_battery_path: list[tuple[float, float]] = []
+        self._orbit_battery_advisory_visible = False
+        self._orbit_battery_advisory_text = ""
+        self._orbit_battery_rtl_available = False
+        self._pending_orbit_battery_targets: list[ConfirmedObject] = []
+        self._pending_orbit_battery_source = "manual"
+        self._pending_orbit_advisory_route: Route | None = None
+        self._pending_orbit_advisory_base_route: Route | None = None
+        self._pending_orbit_advisory_target: ConfirmedObject | None = None
         self._home_persist_path = Path(__file__).resolve().parents[3] / "data" / "artifacts" / "home.json"
         self._home_pick_mode = False
         self._object_spawn_mode = False
@@ -807,6 +871,7 @@ class AppController(QObject):
         self.det_vm.detection.connect(self._on_detections)
         self.det_vm.bboxes.connect(self.video_bridge.set_bboxes)
         self.video_bridge.frameReady.connect(self.frameReady)
+        self.map_bridge.set_path_provider(self.get_active_path_for_sim)
         self.map_bridge.urlChanged.connect(self.mapUrlChanged)
         self.map_bridge.toastRequested.connect(self.toastRequested)
         self.map_bridge.planChanged.connect(self._on_plan_changed)
@@ -856,6 +921,8 @@ class AppController(QObject):
                 window,
             )
         setattr(deps, "route_edit_anchor", None)
+        setattr(deps, "route_edit_preview_path", None)
+        setattr(deps, "route_edit_locked_path", None)
         self._load_persisted_home_location()
         self._update_route_estimate(self._active_path.get_active_path())
         self.map_bridge.render_map()
@@ -987,8 +1054,10 @@ class AppController(QObject):
                 "lat": obj.lat,
                 "lon": obj.lon,
                 "track_id": obj.track_id,
+                "display_index": index + 1,
+                "selected": bool(obj.object_id == getattr(deps, "selected_object_id", None)),
             }
-            for obj in self._objects_store.all()
+            for index, obj in enumerate(self._objects_store.all())
         ]
 
     @Property("QVariantList", notify=uavStatesChanged)
@@ -1083,6 +1152,10 @@ class AppController(QObject):
             return False
         return self._debug_sim.telemetry_enabled()
 
+    @Property(bool, notify=debugDetectorOrbitGuardChanged)
+    def debugDisableDetectorDuringOrbit(self) -> bool:
+        return self._debug_disable_detector_during_orbit
+
     @Property(bool, notify=bridgeModeChanged)
     def bridgeModeEnabled(self) -> bool:
         return self._bridge_mode_enabled
@@ -1107,11 +1180,51 @@ class AppController(QObject):
     def routeBatteryWarning(self) -> bool:
         return self._route_battery_warning
 
+    @Property(bool, notify=routeBatteryAdvisoryChanged)
+    def routeBatteryAdvisoryVisible(self) -> bool:
+        return self._route_battery_advisory_visible
+
+    @Property(str, notify=routeBatteryAdvisoryChanged)
+    def routeBatteryAdvisoryText(self) -> str:
+        return self._route_battery_advisory_text
+
+    @Property(bool, notify=routeBatteryAdvisoryChanged)
+    def routeBatteryReturnHomeAvailable(self) -> bool:
+        return self._route_battery_rtl_available
+
+    @Property(bool, notify=orbitBatteryAdvisoryChanged)
+    def orbitBatteryAdvisoryVisible(self) -> bool:
+        return self._orbit_battery_advisory_visible
+
+    @Property(str, notify=orbitBatteryAdvisoryChanged)
+    def orbitBatteryAdvisoryText(self) -> str:
+        return self._orbit_battery_advisory_text
+
+    @Property(bool, notify=orbitBatteryAdvisoryChanged)
+    def orbitBatteryReturnHomeAvailable(self) -> bool:
+        return self._orbit_battery_rtl_available
+
     @Property(bool, notify=simCameraEnabledChanged)
     def simCameraEnabled(self) -> bool:
         if self._debug_sim is None:
             return False
         return self._debug_sim.camera_enabled()
+
+    @Property(bool, notify=recoverableMissionChanged)
+    def recoverableMissionAvailable(self) -> bool:
+        return self._recoverable_mission is not None
+
+    @Property(str, notify=recoverableMissionChanged)
+    def recoverableMissionText(self) -> str:
+        if self._recoverable_mission is None:
+            return ""
+        points = len(self._recoverable_mission.path)
+        targets = len(self._recoverable_mission.confirmed_objects)
+        return f"Restore last Unreal mission: {points} route points, {targets} targets."
+
+    @Property(str, notify=linkStatusChanged)
+    def unrealRuntimeStatus(self) -> str:
+        return self._unreal_status
 
     @Property(str, constant=True)
     def tileCacheDir(self) -> str:
@@ -1128,12 +1241,25 @@ class AppController(QObject):
     def startDetector(self) -> None:
         self.det_vm.start()
         self._detector_running = True
+        self._detector_forced_paused_by_orbit = False
         self.detectorRunningChanged.emit()
 
     @Slot()
     def stopDetector(self) -> None:
         self.det_vm.stop()
         self._detector_running = False
+        if hasattr(self.det_vm, "reset"):
+            try:
+                self.det_vm.reset()
+            except Exception:
+                _log.debug("Failed to reset detector view-model", exc_info=True)
+        try:
+            self.video_bridge.clear_overlays()
+        except Exception:
+            _log.debug("Failed to clear video overlays after detector stop", exc_info=True)
+        self._detection_conf = 0.0
+        self._last_detection_ts = None
+        self._update_stats()
         self.detectorRunningChanged.emit()
 
     def attach_unreal_link(self, link: UnrealLinkService) -> None:
@@ -1196,6 +1322,8 @@ class AppController(QObject):
             return
         if not self._detector_running:
             return
+        if self._orbit_active:
+            return
         if deps.frame_queue is None:
             return
         now = time.perf_counter()
@@ -1205,7 +1333,7 @@ class AppController(QObject):
             return
         try:
             frame_bgr = self._qimage_to_bgr_frame(image)
-            captured_at = datetime.utcnow()
+            captured_at = utc_now()
             frame_id = f"unreal_local:{captured_at.isoformat(timespec='microseconds')}"
             if self._latest_telemetry is not None:
                 self._remember_unreal_local_telemetry(
@@ -1288,7 +1416,7 @@ class AppController(QObject):
             return
         if frame_width <= 0 or frame_height <= 0:
             return
-        captured_at = self._coerce_datetime(getattr(frame_meta, "timestamp", None)) or datetime.utcnow()
+        captured_at = self._coerce_datetime(getattr(frame_meta, "timestamp", None)) or utc_now()
         camera_id = str(getattr(frame_meta, "camera_id", None) or "unreal_local")
         # Important for K/N aggregation: frame_id must be unique per frame, not constant camera_id.
         frame_id = f"{camera_id}:{captured_at.isoformat(timespec='microseconds')}"
@@ -1348,6 +1476,8 @@ class AppController(QObject):
     def process_backend_detections(self, objects: list[dict[str, object]]) -> None:
         if not objects:
             return
+        if self._orbit_active or self._orbit_flow_state != OrbitFlowState.NORMAL_FLIGHT:
+            return
         emitted = 0
         for obj in objects:
             lat = obj.get("lat")
@@ -1358,7 +1488,9 @@ class AppController(QObject):
             except (TypeError, ValueError):
                 continue
             class_id = self._extract_class_id(obj)
-            ts = self._coerce_datetime(obj.get("timestamp")) or datetime.utcnow()
+            ts = self._coerce_datetime(obj.get("timestamp")) or utc_now()
+            if self._should_suppress_orbit_duplicate(lat_f, lon_f, class_id=class_id):
+                continue
             updates = self._target_tracker.update(
                 [
                     TargetObservation(
@@ -1470,7 +1602,10 @@ class AppController(QObject):
         if status == self._unreal_status:
             return
         self._unreal_status = status
+        self.linkStatusChanged.emit()
         if status == "waiting_for_route":
+            if self._ignore_transient_unreal_waiting_for_route():
+                return
             self._emit_warning(
                 key="unreal_waiting_route",
                 message="Unreal waiting for route; draw + confirm plan",
@@ -1485,13 +1620,14 @@ class AppController(QObject):
                 cooldown_s=8,
             )
             if self._backend == "unreal" and self._mission_state != MissionState.PREFLIGHT:
+                self._stash_recoverable_mission()
                 self._mission.abort_to_preflight("unreal_disconnected")
                 self._pending_unreal_autostart = False
                 self._active_path.set_normal()
-                self._clear_confirmed_objects()
                 self.map_bridge.render_map()
                 self.planConfirmedChanged.emit()
                 self.flightControlsChanged.emit()
+                self.toastRequested.emit("Unreal stopped. Restart sim and restore the saved mission.")
         elif status == "connected":
             self._emit_warning(
                 key="unreal_connected",
@@ -1612,6 +1748,73 @@ class AppController(QObject):
         self._video_visible = bool(visible)
         if self._unreal_link is not None:
             self._unreal_link.set_camera_enabled(self._video_visible)
+        if not self._video_visible:
+            try:
+                self.video_bridge.clear_overlays()
+            except Exception:
+                _log.debug("Failed to clear overlays on tab switch", exc_info=True)
+            if hasattr(self.det_vm, "reset"):
+                try:
+                    self.det_vm.reset()
+                except Exception:
+                    _log.debug("Failed to reset detector VM on tab switch", exc_info=True)
+
+    @Slot(bool)
+    def setDebugDisableDetectorDuringOrbit(self, enabled: bool) -> None:
+        self._debug_disable_detector_during_orbit = bool(enabled)
+        setattr(settings, "debug_disable_detector_during_orbit", self._debug_disable_detector_during_orbit)
+        self.debugDetectorOrbitGuardChanged.emit()
+        if self._orbit_active:
+            return
+        if not self._debug_disable_detector_during_orbit:
+            self._restore_detector_after_orbit()
+
+    @Slot(str)
+    def selectConfirmedObject(self, object_id: str) -> None:
+        target = self._objects_store.get(str(object_id))
+        if target is None:
+            return
+        self._on_object_selected(target.object_id, float(target.lat), float(target.lon))
+
+    @Slot()
+    def restoreRecoverableMission(self) -> None:
+        snapshot = self._recoverable_mission
+        if snapshot is None or self._backend != "unreal" or self._unreal_link is None:
+            return
+        route = self._route_from_points(snapshot.path)
+        if route is None:
+            self.toastRequested.emit("Recoverable mission route is unavailable")
+            return
+        self._plan_vm.save_plan(list(snapshot.path))
+        self._mission.confirm_plan(list(snapshot.path))
+        if snapshot.home is not None:
+            try:
+                self._set_home_location(float(snapshot.home["lat"]), float(snapshot.home["lon"]))
+            except Exception:
+                pass
+        self._clear_confirmed_objects()
+        for obj in snapshot.confirmed_objects:
+            bus.emit(Event.OBJECT_CONFIRMED_UI, dict(obj))
+        if snapshot.selected_object_id:
+            self._objects_store.set_selected(snapshot.selected_object_id)
+            deps.selected_object_id = snapshot.selected_object_id
+        if not self._send_unreal_route(route):
+            self.toastRequested.emit("Failed to restore route to Unreal")
+            return
+        self._schedule_unreal_autostart()
+        self._recoverable_mission = None
+        self.recoverableMissionChanged.emit()
+        self.planConfirmedChanged.emit()
+        self.flightControlsChanged.emit()
+        self.map_bridge.render_map()
+        self.toastRequested.emit("Recoverable mission restored")
+
+    @Slot()
+    def discardRecoverableMission(self) -> None:
+        if self._recoverable_mission is None:
+            return
+        self._recoverable_mission = None
+        self.recoverableMissionChanged.emit()
 
     @Slot(str)
     def setUnrealVideoMode(self, mode: str) -> None:
@@ -1663,7 +1866,7 @@ class AppController(QObject):
             return
         self._home_pick_mode = True
         self.homePickModeChanged.emit()
-        self.toastRequested.emit("Click the map to set home")
+        self.toastRequested.emit("Click the map to set home; click current home again to clear it")
 
     @Slot()
     def stopHomePickMode(self) -> None:
@@ -1675,6 +1878,18 @@ class AppController(QObject):
     @Slot(float, float)
     def setHomeFromMap(self, lat: float, lon: float) -> None:
         _log.info("HOME_PICK click lat=%.6f lon=%.6f", lat, lon)
+        current_home = getattr(deps, "home_location", None)
+        if isinstance(current_home, dict):
+            current_lat = current_home.get("lat")
+            current_lon = current_home.get("lon")
+            if current_lat is not None and current_lon is not None:
+                try:
+                    dist_m = haversine_m((float(lat), float(lon)), (float(current_lat), float(current_lon)))
+                except (TypeError, ValueError):
+                    dist_m = float("inf")
+                if dist_m <= 5.0:
+                    self.clearHomeLocation()
+                    return
         self._set_home_location(lat, lon)
         self.stopHomePickMode()
         self._set_map_refresh_needed(True)
@@ -1725,7 +1940,7 @@ class AppController(QObject):
             "lat": lat_val,
             "lon": lon_val,
             "track_id": None,
-            "timestamp": datetime.utcnow(),
+            "timestamp": utc_now(),
         }
         bus.emit(Event.OBJECT_CONFIRMED_UI, payload)
         self._objects_store.set_selected(object_id)
@@ -1761,11 +1976,20 @@ class AppController(QObject):
         if not self._telemetry_available() and self._backend != "unreal":
             self.toastRequested.emit("Telemetry unavailable; enable Sim telemetry or connect UAV")
             return
+        if self._maybe_prompt_route_battery_advisory(path, action="confirm_plan"):
+            return
         if not self._mission.confirm_plan(path):
             self.toastRequested.emit("Route invalid; cannot confirm")
             return
+        setattr(deps, "active_path_kind", "mission")
+        setattr(deps, "debug_flight_progress", 0.0)
         self._active_path.set_normal()
         self._update_route_estimate(self._active_path.get_active_path())
+        render_now = getattr(self.map_bridge, "_render_map_now", None)
+        if callable(render_now):
+            render_now()
+        else:
+            self.map_bridge.render_map()
         self.planConfirmedChanged.emit()
         self.flightControlsChanged.emit()
         if self._latest_telemetry:
@@ -1777,21 +2001,12 @@ class AppController(QObject):
                     cooldown_s=8,
                 )
         if self._backend == "unreal" and self._unreal_link is not None:
-            route = self._route_from_points(path)
-            if route is None:
-                self.toastRequested.emit("Route invalid; cannot send")
-                return
-            if not self._send_unreal_route(route):
-                self.toastRequested.emit("Failed to send route to Unreal")
-                return
-            self._schedule_unreal_autostart()
-        else:
-            self.startFlight()
-        if self._mission.current_state != MissionState.IN_FLIGHT:
-            self.toastRequested.emit("Plan confirmed")
+            self.startFlight(skip_checks=True)
+            return
+        self.toastRequested.emit("Plan confirmed")
 
     @Slot()
-    def startFlight(self, *, skip_checks: bool = False) -> None:
+    def startFlight(self, *, skip_checks: bool = False, allow_unsafe_energy: bool = False) -> None:
         if not self._mission.plan_confirmed:
             self.toastRequested.emit("Confirm the plan first")
             return
@@ -1813,16 +2028,25 @@ class AppController(QObject):
             )
             if not self._allow_unsafe_start:
                 return
-        if not skip_checks and self._latest_telemetry and not self._route_energy_ok(self._mission.confirmed_plan or []):
-            self._emit_warning(
-                key="battery_route_insufficient",
-                message="Insufficient battery for planned route",
-                severity="warn",
-                cooldown_s=8,
-            )
+        confirmed_path = list(self._mission.confirmed_plan or [])
+        if (
+            not allow_unsafe_energy
+            and self._maybe_prompt_route_battery_advisory(confirmed_path, action="start_flight")
+        ):
             return
+        if self._backend == "unreal" and self._unreal_link is not None:
+            route = self._route_from_points(confirmed_path)
+            if route is None:
+                self.toastRequested.emit("Route invalid; cannot send")
+                return
+            if not self._send_unreal_route(route):
+                self.toastRequested.emit("Failed to send route to Unreal")
+                return
         if self._mission.start_flight(skip_checks=skip_checks):
             self._commands_enabled = True
+            if self._recoverable_mission is not None:
+                self._recoverable_mission = None
+                self.recoverableMissionChanged.emit()
             self._route_complete_announced = False
             self._rtl_forced = False
             self._rtl_route_sent = False
@@ -1840,22 +2064,28 @@ class AppController(QObject):
         if self._latest_telemetry is None:
             self.toastRequested.emit("Telemetry unavailable; cannot enter route edit")
             return
+        current_plan = self._mission.confirmed_plan or self._plan_vm.get_path() or []
+        if len(current_plan) < 2:
+            self.toastRequested.emit("Current route is too short to edit")
+            return
         if self._backend == "unreal" and self._unreal_link is not None:
             if not self._try_unreal_hold_for_route_edit():
                 self.toastRequested.emit("Failed to send HOLD to Unreal")
                 return
-        current_plan = self._mission.confirmed_plan or self._plan_vm.get_path() or []
-        self._route_edit_original_plan = [(float(lat), float(lon)) for lat, lon in current_plan]
-        self._staged_plan = None
-        self._route_edit_mode = True
         anchor = (float(self._latest_telemetry.lat), float(self._latest_telemetry.lon))
+        locked_path, editable_tail = split_route_for_edit(current_plan, anchor)
+        self._route_edit_original_plan = [(float(lat), float(lon)) for lat, lon in current_plan]
+        self._staged_plan = list(editable_tail)
+        self._route_edit_mode = True
         self._route_edit_anchor = anchor
-        deps.plan_data = {"path": [anchor, anchor]}
+        self._route_edit_locked_path = list(locked_path)
         deps.debug_orbit_path = None
         deps.rtl_path = None
         setattr(deps, "route_edit_anchor", {"lat": anchor[0], "lon": anchor[1]})
+        setattr(deps, "route_edit_preview_path", list(editable_tail))
+        setattr(deps, "route_edit_locked_path", list(locked_path))
         self.map_bridge.render_map()
-        self.toastRequested.emit("Edit mode: draw a new path on the map, double-click to finish, then Apply")
+        self.toastRequested.emit("Edit mode: remaining route is unlocked; remove or append points, then Apply")
         self.flightControlsChanged.emit()
 
     @Slot()
@@ -1865,19 +2095,9 @@ class AppController(QObject):
         if not self._staged_plan:
             self.toastRequested.emit("Draw at least 1 point before apply")
             return
-        pts = list(self._staged_plan)
-        if self._route_edit_anchor is not None:
-            if not pts or haversine_m(self._route_edit_anchor, pts[0]) > 1.0:
-                pts = [self._route_edit_anchor] + pts
-        deduped: list[tuple[float, float]] = []
-        for pt in pts:
-            if not deduped:
-                deduped.append(pt)
-                continue
-            if haversine_m(deduped[-1], pt) <= 1.0:
-                continue
-            deduped.append(pt)
-        pts = deduped
+        pts = self._normalize_route_edit_points(self._staged_plan)
+        if self._maybe_prompt_route_battery_advisory(pts, action="apply_route_edits"):
+            return
         route = self._route_from_points(pts)
         if route is None:
             self.toastRequested.emit("Route needs at least 2 points")
@@ -1893,14 +2113,10 @@ class AppController(QObject):
         self._mission.confirm_plan(pts)
         deps.rtl_path = None
         deps.debug_orbit_path = None
-        self._route_edit_anchor = None
-        self._route_edit_original_plan = None
-        setattr(deps, "route_edit_anchor", None)
+        self._clear_route_edit_state()
         self._active_path.set_normal()
         self._update_route_estimate(self._active_path.get_active_path())
-        self._route_edit_mode = False
-        self._hold_sent_for_edit = False
-        self._staged_plan = None
+        self.map_bridge.render_map()
         self.planConfirmedChanged.emit()
         self.flightControlsChanged.emit()
         self.map_bridge.render_map()
@@ -1919,12 +2135,7 @@ class AppController(QObject):
         if self._backend == "unreal" and self._unreal_link is not None:
             if not self._try_unreal_resume_after_route_edit():
                 resume_failed = True
-        self._route_edit_mode = False
-        self._hold_sent_for_edit = False
-        self._staged_plan = None
-        self._route_edit_anchor = None
-        self._route_edit_original_plan = None
-        setattr(deps, "route_edit_anchor", None)
+        self._clear_route_edit_state()
         self._active_path.set_normal()
         deps.rtl_path = None
         deps.debug_orbit_path = None
@@ -1940,13 +2151,6 @@ class AppController(QObject):
     def returnToHome(self) -> None:
         if self._mission_state != MissionState.IN_FLIGHT:
             return
-        if self._backend == "unreal" and self._unreal_link is not None:
-            if self._unreal_link.send_command("RTL"):
-                self._mission.trigger_rtl("operator_rtl")
-                self.toastRequested.emit("Return-to-home initiated")
-            else:
-                self.toastRequested.emit("Failed to send RTL to Unreal")
-            return
         if not self._current_action_policy().can_rtl:
             if not self._link_monitor.is_link_ok():
                 self._emit_warning(
@@ -1956,19 +2160,10 @@ class AppController(QObject):
                     cooldown_s=6,
                 )
             return
-        if not self._send_rtl_route():
-            return
-        self._mission.trigger_rtl("operator_rtl")
-        self.toastRequested.emit("Return-to-home initiated")
+        self._initiate_rtl(reason="operator_rtl", user_message="Return-to-home initiated")
 
     @Slot()
     def sendRtlRoute(self) -> None:
-        if self._backend == "unreal" and self._unreal_link is not None:
-            if self._unreal_link.send_command("RTL"):
-                self.toastRequested.emit("RTL command sent to Unreal")
-            else:
-                self.toastRequested.emit("Failed to send RTL to Unreal")
-            return
         if not self._current_action_policy().can_send_rtl_route:
             if not self._link_monitor.is_link_ok():
                 self._emit_warning(
@@ -1978,7 +2173,8 @@ class AppController(QObject):
                     cooldown_s=6,
                 )
             return
-        self._send_rtl_route()
+        if self._send_rtl_route():
+            self.toastRequested.emit("RTL route sent")
 
     @Slot()
     def completeLanding(self) -> None:
@@ -2062,7 +2258,7 @@ class AppController(QObject):
         if not targets:
             self.toastRequested.emit("Selected objects unavailable")
             return
-        self._orbit_targets(targets, source="manual")
+        self._orbit_targets(self._order_targets_for_orbit(targets), source="manual")
 
     @Slot()
     def orbitAllConfirmedObjects(self) -> None:
@@ -2070,7 +2266,65 @@ class AppController(QObject):
         if not targets:
             self.toastRequested.emit("No confirmed objects available")
             return
-        self._orbit_targets(targets, source="manual")
+        self._orbit_targets(self._order_targets_for_orbit(targets), source="manual")
+
+    @Slot(str)
+    def respondRouteBatteryAdvisory(self, action: str) -> None:
+        action = str(action or "").strip().lower()
+        pending_action = self._pending_route_battery_action
+        pending_path = list(self._pending_route_battery_path)
+        rtl_available = self._route_battery_rtl_available
+        self._clear_route_battery_advisory()
+        if action == "cancel":
+            self.toastRequested.emit("Route action canceled")
+            return
+        if action == "rtl":
+            if not rtl_available:
+                self.toastRequested.emit("Battery is insufficient even for safe RTL")
+                return
+            self._initiate_rtl(reason="route_battery_advisory", user_message="Returning home for recharge")
+            return
+        if action != "proceed":
+            return
+        if pending_action == "confirm_plan":
+            if pending_path:
+                self._confirm_plan_after_battery_override(pending_path)
+            return
+        if pending_action == "start_flight":
+            self.startFlight(allow_unsafe_energy=True)
+            return
+        if pending_action == "apply_route_edits":
+            self._apply_route_edits_after_battery_override(pending_path)
+
+    @Slot(str)
+    def respondOrbitBatteryAdvisory(self, action: str) -> None:
+        action = str(action or "").strip().lower()
+        targets = list(self._pending_orbit_battery_targets)
+        source = self._pending_orbit_battery_source
+        route = self._pending_orbit_advisory_route
+        base_route = self._pending_orbit_advisory_base_route
+        target = self._pending_orbit_advisory_target
+        self._clear_orbit_battery_advisory()
+        if action == "cancel":
+            self.toastRequested.emit("Orbit canceled")
+            return
+        if action == "rtl":
+            if not self._orbit_battery_rtl_available:
+                self.toastRequested.emit("Battery is insufficient even for safe RTL")
+                return
+            self._initiate_rtl(reason="orbit_battery_advisory", user_message="Returning home for recharge")
+            return
+        if action == "proceed":
+            if not targets or route is None or base_route is None or target is None:
+                self.toastRequested.emit("Orbit target unavailable")
+                return
+            self._stage_orbit_route(
+                route=route,
+                base_route=base_route,
+                target=target,
+                active_targets=[target],
+                source=f"{source}_forced",
+            )
 
     @Slot(bool)
     def setSimTelemetryEnabled(
@@ -2339,6 +2593,7 @@ class AppController(QObject):
         track_id = payload.get("track_id")
         track_str = f", track {track_id}" if track_id is not None else ""
         msg = f"Object {obj_id} (class {cls_id}{track_str}, conf {conf:.2f}) detected"
+        self._write_confirmed_detection_json(payload)
         self.objectNotificationReceived.emit(obj_id, cls_id, conf, msg, track_id)
 
     def _auto_orbit_after_confirm(self, object_id: str) -> None:
@@ -2421,6 +2676,28 @@ class AppController(QObject):
                 queued.append((target, source))
         return queued
 
+    def _pop_next_pending_orbit_target(
+        self,
+        sample: TelemetrySample | None = None,
+    ) -> tuple[ConfirmedObject, str] | None:
+        queued = self._dequeue_pending_orbit_targets()
+        if not queued:
+            return None
+        if sample is None:
+            target, source = queued[0]
+            for queued_target, queued_source in queued[1:]:
+                self._queue_pending_orbit_target(queued_target, source=queued_source)
+            return target, source
+        current = (float(sample.lat), float(sample.lon))
+        best_idx = min(
+            range(len(queued)),
+            key=lambda idx: haversine_m(current, (float(queued[idx][0].lat), float(queued[idx][0].lon))),
+        )
+        target, source = queued.pop(best_idx)
+        for queued_target, queued_source in queued:
+            self._queue_pending_orbit_target(queued_target, source=queued_source)
+        return target, source
+
     def attach_debug_sim(self, sim: DebugSimulationService) -> None:
         self._debug_sim = sim
         self._debug_sim.set_speed_mps(self._bridge_speed_mps)
@@ -2429,9 +2706,34 @@ class AppController(QObject):
         return self._mission.confirmed_plan or self._plan_vm.get_path()
 
     def get_active_path_for_sim(self) -> list[tuple[float, float]]:
-        return self._active_path.get_active_path()
+        path = list(self._active_path.get_active_path())
+        telemetry = self._latest_telemetry
+        if (
+            telemetry is None
+            or not path
+            or self._mission_state != MissionState.IN_FLIGHT
+            or self._active_path.mode == ActivePathMode.ORBIT
+        ):
+            return path
+        current = (float(telemetry.lat), float(telemetry.lon))
+        if haversine_m(current, path[0]) <= 2.0:
+            return path
+        route = [Waypoint(lat=lat, lon=lon, alt=float(telemetry.alt)) for lat, lon in path]
+        nearest_idx = self._nearest_waypoint_index(float(telemetry.lat), float(telemetry.lon), route)
+        nearest_dist = haversine_m(current, path[nearest_idx])
+        if nearest_dist > 250.0:
+            return path
+        remaining_path = path[nearest_idx:]
+        if nearest_dist <= 2.0:
+            return remaining_path
+        return [current, *remaining_path]
 
     def _on_active_path_changed(self, _mode: ActivePathMode) -> None:
+        setattr(
+            deps,
+            "active_path_kind",
+            "maneuver" if self._active_path.mode == ActivePathMode.ORBIT else "mission",
+        )
         self._update_route_estimate(self._active_path.get_active_path())
         try:
             self.map_bridge.render_map()
@@ -2497,12 +2799,7 @@ class AppController(QObject):
             self._pending_orbit_queue = []
             self._pending_orbit_ids = set()
             self._set_orbit_flow_state(OrbitFlowState.NORMAL_FLIGHT, reason="mission_state_reset")
-            self._route_edit_mode = False
-            self._hold_sent_for_edit = False
-            self._staged_plan = None
-            self._route_edit_anchor = None
-            self._route_edit_original_plan = None
-            setattr(deps, "route_edit_anchor", None)
+            self._clear_route_edit_state()
             self._commands_enabled = True
             self._rtl_forced = False
             self._rtl_route_sent = False
@@ -2527,12 +2824,7 @@ class AppController(QObject):
             self._pending_orbit_queue = []
             self._pending_orbit_ids = set()
             self._set_orbit_flow_state(OrbitFlowState.NORMAL_FLIGHT, reason="mission_postflight")
-            self._route_edit_mode = False
-            self._hold_sent_for_edit = False
-            self._staged_plan = None
-            self._route_edit_anchor = None
-            self._route_edit_original_plan = None
-            setattr(deps, "route_edit_anchor", None)
+            self._clear_route_edit_state()
             deps.rtl_path = None
             deps.debug_orbit_path = None
         if new_state in (MissionState.PREFLIGHT, MissionState.READY, MissionState.POSTFLIGHT):
@@ -2635,7 +2927,9 @@ class AppController(QObject):
                 self.map_bridge.render_map()
                 self.flightControlsChanged.emit()
                 return
-            self._staged_plan = path
+            normalized = self._normalize_route_edit_points(path)
+            self._staged_plan = normalized
+            setattr(deps, "route_edit_preview_path", list(normalized))
             self.flightControlsChanged.emit()
             return
         self._mission.invalidate_plan("plan_changed")
@@ -2649,6 +2943,7 @@ class AppController(QObject):
         deps.selected_object_id = object_id
         self._objects_store.set_selected(object_id)
         deps.debug_target = {"lat": lat, "lon": lon}
+        self._on_objects_changed()
         self.map_bridge.render_map()
         self.flightControlsChanged.emit()
 
@@ -2700,8 +2995,10 @@ class AppController(QObject):
                 "lat": obj.lat,
                 "lon": obj.lon,
                 "track_id": obj.track_id,
+                "display_index": index + 1,
+                "selected": bool(obj.object_id == getattr(deps, "selected_object_id", None)),
             }
-            for obj in all_objects
+            for index, obj in enumerate(all_objects)
         ]
         self.confirmedObjectsChanged.emit()
         self.flightControlsChanged.emit()
@@ -2846,6 +3143,31 @@ class AppController(QObject):
             supports_orbit,
         )
 
+    def _normalize_route_edit_points(self, pts: list[tuple[float, float]] | None) -> list[tuple[float, float]]:
+        normalized = [(float(lat), float(lon)) for lat, lon in (pts or [])]
+        if self._route_edit_anchor is not None:
+            if not normalized:
+                normalized = [self._route_edit_anchor]
+            elif haversine_m(self._route_edit_anchor, normalized[0]) > 1.0:
+                normalized = [self._route_edit_anchor, *normalized]
+            else:
+                normalized[0] = self._route_edit_anchor
+        normalized = dedupe_path(normalized)
+        if self._route_edit_anchor is not None and len(normalized) < 2:
+            normalized = [self._route_edit_anchor, self._route_edit_anchor]
+        return normalized
+
+    def _clear_route_edit_state(self) -> None:
+        self._route_edit_mode = False
+        self._hold_sent_for_edit = False
+        self._staged_plan = None
+        self._route_edit_anchor = None
+        self._route_edit_original_plan = None
+        self._route_edit_locked_path = None
+        setattr(deps, "route_edit_anchor", None)
+        setattr(deps, "route_edit_preview_path", None)
+        setattr(deps, "route_edit_locked_path", None)
+
     def _resolve_landing_target(self) -> WorldCoord | None:
         home = getattr(deps, "home_location", None)
         if isinstance(home, dict):
@@ -2856,19 +3178,9 @@ class AppController(QObject):
                     return WorldCoord(lat=float(lat), lon=float(lon))
                 except (TypeError, ValueError):
                     return None
-        for lat_key, lon_key in (("home_lat", "home_lon"), ("base_lat", "base_lon")):
-            lat = getattr(settings, lat_key, None)
-            lon = getattr(settings, lon_key, None)
-            if lat is not None and lon is not None:
-                try:
-                    return WorldCoord(lat=float(lat), lon=float(lon))
-                except (TypeError, ValueError):
-                    return None
         path = self._mission.confirmed_plan or self._plan_vm.get_path()
-        if path:
-            lat, lon = path[0]
-            return WorldCoord(lat=float(lat), lon=float(lon))
-        return None
+        route = self._route_from_points(path) or Route(version=1, waypoints=[], active_index=None)
+        return resolve_base_location(settings, route, self._latest_telemetry)
 
     def _is_at_home(self) -> bool:
         if self._latest_telemetry is None:
@@ -2918,7 +3230,22 @@ class AppController(QObject):
             }
             if orbit_target_alt is not None and math.isfinite(float(orbit_target_alt)):
                 payload["orbit_target"]["alt"] = float(orbit_target_alt)
-        return self._unreal_link.send_route(payload)
+        sent = self._unreal_link.send_route(payload)
+        if sent:
+            self._last_unreal_route_sent_monotonic = time.monotonic()
+        return sent
+
+    def _ignore_transient_unreal_waiting_for_route(self) -> bool:
+        return self._within_unreal_route_send_grace()
+
+    def _within_unreal_route_send_grace(self) -> bool:
+        if self._backend != "unreal":
+            return False
+        last_sent = float(getattr(self, "_last_unreal_route_sent_monotonic", 0.0) or 0.0)
+        if last_sent <= 0.0:
+            return False
+        grace_s = max(0.0, float(getattr(self, "_unreal_waiting_route_grace_s", 2.5) or 0.0))
+        return (time.monotonic() - last_sent) <= grace_s
 
     def _recover_from_failed_orbit_attempt(self, *, reason: str, user_message: str) -> None:
         _log.warning("Orbit attempt failed: %s", reason)
@@ -2929,6 +3256,9 @@ class AppController(QObject):
         self._clear_reaction_slowdown()
         self._pending_orbit_queue = []
         self._pending_orbit_ids.clear()
+        setattr(deps, "debug_orbit_targets", [])
+        setattr(deps, "debug_orbit_sequence", [])
+        setattr(deps, "debug_orbit_preview_paths", [])
         self._set_orbit_flow_state(OrbitFlowState.NORMAL_FLIGHT, reason=f"orbit_failed:{reason}")
         self.toastRequested.emit(user_message)
 
@@ -2971,6 +3301,173 @@ class AppController(QObject):
             },
         )
 
+    def _clear_route_battery_advisory(self) -> None:
+        changed = (
+            self._route_battery_advisory_visible
+            or bool(self._route_battery_advisory_text)
+            or self._route_battery_rtl_available
+            or bool(self._pending_route_battery_action)
+            or bool(self._pending_route_battery_path)
+        )
+        self._route_battery_advisory_visible = False
+        self._route_battery_advisory_text = ""
+        self._route_battery_rtl_available = False
+        self._pending_route_battery_action = ""
+        self._pending_route_battery_path = []
+        if changed:
+            self.routeBatteryAdvisoryChanged.emit()
+
+    def _clear_orbit_battery_advisory(self) -> None:
+        changed = (
+            self._orbit_battery_advisory_visible
+            or bool(self._orbit_battery_advisory_text)
+            or self._orbit_battery_rtl_available
+            or bool(self._pending_orbit_battery_targets)
+        )
+        self._orbit_battery_advisory_visible = False
+        self._orbit_battery_advisory_text = ""
+        self._orbit_battery_rtl_available = False
+        self._pending_orbit_battery_targets = []
+        self._pending_orbit_battery_source = "manual"
+        self._pending_orbit_advisory_route = None
+        self._pending_orbit_advisory_base_route = None
+        self._pending_orbit_advisory_target = None
+        if changed:
+            self.orbitBatteryAdvisoryChanged.emit()
+
+    def _route_energy_summary(
+        self,
+        path: list[tuple[float, float]],
+        *,
+        telemetry: TelemetrySample | None = None,
+    ) -> dict[str, float | bool] | None:
+        sample = telemetry or self._latest_telemetry
+        if sample is None:
+            fallback_lat, fallback_lon = (0.0, 0.0)
+            if path:
+                fallback_lat, fallback_lon = path[0]
+            else:
+                center = getattr(settings, "map_center", None)
+                if isinstance(center, (list, tuple)) and len(center) >= 2:
+                    try:
+                        fallback_lat, fallback_lon = float(center[0]), float(center[1])
+                    except (TypeError, ValueError):
+                        pass
+            sample = TelemetrySample(
+                lat=fallback_lat,
+                lon=fallback_lon,
+                alt=120.0,
+                battery=1.0,
+                battery_percent=100.0,
+                timestamp=utc_now(),
+            )
+        route = self._route_from_points(path)
+        if route is None:
+            return None
+        estimate = self._estimate_route_energy(route, telemetry=sample)
+        if estimate is None:
+            return None
+        available = sample.battery_percent
+        if available is None:
+            available = max(0.0, min(100.0, sample.battery * 100.0))
+        return {
+            "can_complete": bool(estimate.can_complete),
+            "required_percent": float(estimate.required_percent),
+            "margin_percent": float(estimate.margin_percent),
+            "available_percent": float(available),
+            "reserved_percent": float(getattr(settings, "min_return_percent", 20.0) or 0.0),
+        }
+
+    def _rtl_route_available(self) -> bool:
+        route = self._build_rtl_route(silent=True)
+        if route is None:
+            return False
+        estimate = self._estimate_route_energy(route)
+        return bool(estimate.can_complete) if estimate is not None else False
+
+    def _show_route_battery_advisory(
+        self,
+        *,
+        action: str,
+        path: list[tuple[float, float]],
+        summary: dict[str, float | bool],
+    ) -> None:
+        required = float(summary.get("required_percent", 0.0) or 0.0)
+        margin = float(summary.get("margin_percent", 0.0) or 0.0)
+        available = float(summary.get("available_percent", 0.0) or 0.0)
+        reserved = float(summary.get("reserved_percent", 0.0) or 0.0)
+        self._pending_route_battery_action = action
+        self._pending_route_battery_path = list(path)
+        self._route_battery_rtl_available = self._rtl_route_available()
+        self._route_battery_advisory_visible = True
+        self._route_battery_advisory_text = (
+            "Route may not be completed safely. "
+            f"Need about {required:.1f}% plus reserve {reserved:.1f}%; "
+            f"available {available:.1f}%, margin {margin:.1f}%."
+        )
+        self.routeBatteryAdvisoryChanged.emit()
+
+    def _maybe_prompt_route_battery_advisory(self, path: list[tuple[float, float]], *, action: str) -> bool:
+        summary = self._route_energy_summary(path)
+        if summary is None or bool(summary["can_complete"]):
+            return False
+        self._emit_warning(
+            key="battery_route_insufficient",
+            message="Insufficient battery for planned route",
+            severity="warn",
+            cooldown_s=8,
+        )
+        self._show_route_battery_advisory(action=action, path=path, summary=summary)
+        return True
+
+    def _confirm_plan_after_battery_override(self, path: list[tuple[float, float]]) -> None:
+        if not self._mission.confirm_plan(path):
+            self.toastRequested.emit("Route invalid; cannot confirm")
+            return
+        setattr(deps, "active_path_kind", "mission")
+        setattr(deps, "debug_flight_progress", 0.0)
+        self._active_path.set_normal()
+        self._update_route_estimate(self._active_path.get_active_path())
+        render_now = getattr(self.map_bridge, "_render_map_now", None)
+        if callable(render_now):
+            render_now()
+        else:
+            self.map_bridge.render_map()
+        self.planConfirmedChanged.emit()
+        self.flightControlsChanged.emit()
+        if self._backend == "unreal" and self._unreal_link is not None:
+            self.startFlight(skip_checks=True, allow_unsafe_energy=True)
+            return
+        self.toastRequested.emit("Plan confirmed")
+
+    def _apply_route_edits_after_battery_override(self, pts: list[tuple[float, float]]) -> None:
+        route = self._route_from_points(pts)
+        if route is None:
+            self.toastRequested.emit("Route needs at least 2 points")
+            return
+        resume_failed = False
+        if self._backend == "unreal" and self._unreal_link is not None:
+            if not self._send_unreal_route(route):
+                self.toastRequested.emit("Failed to send updated route to Unreal")
+                return
+            if not self._try_unreal_resume_after_route_edit():
+                resume_failed = True
+        self._plan_vm.save_plan(pts)
+        self._mission.confirm_plan(pts)
+        deps.rtl_path = None
+        deps.debug_orbit_path = None
+        self._clear_route_edit_state()
+        self._active_path.set_normal()
+        self._update_route_estimate(self._active_path.get_active_path())
+        self.map_bridge.render_map()
+        self.planConfirmedChanged.emit()
+        self.flightControlsChanged.emit()
+        self.map_bridge.render_map()
+        if resume_failed:
+            self.toastRequested.emit("Route sent; resume manually in Unreal")
+        else:
+            self.toastRequested.emit("Route updates applied")
+
     def _set_camera_status_detail(self, message: str) -> None:
         if message == self._camera_status_detail:
             return
@@ -2981,13 +3478,6 @@ class AppController(QObject):
         if path is None:
             path = self._active_path.get_active_path()
         max_distance_m = self._resolve_max_distance_m()
-        reserved = float(getattr(settings, "min_return_percent", 20.0) or 0.0)
-        available = 100.0
-        if self._latest_telemetry and self._latest_telemetry.battery_percent is not None:
-            available = float(self._latest_telemetry.battery_percent)
-        route_available = available
-        if self._mission_state in (MissionState.PREFLIGHT, MissionState.READY):
-            route_available = 100.0
         fallback_lat, fallback_lon = (0.0, 0.0)
         if path:
             fallback_lat, fallback_lon = path[-1]
@@ -2998,20 +3488,23 @@ class AppController(QObject):
                     fallback_lat, fallback_lon = float(center[0]), float(center[1])
                 except (TypeError, ValueError):
                     pass
+        available = 100.0
+        if self._latest_telemetry and self._latest_telemetry.battery_percent is not None:
+            available = float(self._latest_telemetry.battery_percent)
         telemetry = self._latest_telemetry or TelemetrySample(
             lat=fallback_lat,
             lon=fallback_lon,
             alt=120.0,
             battery=1.0,
             battery_percent=available,
-            timestamp=datetime.utcnow(),
+            timestamp=utc_now(),
         )
         base_route = self._route_from_points(path) or Route(version=1, waypoints=[], active_index=None)
         base = self._resolve_base_location(base_route, telemetry)
         deps.route_stats = {
             "max_distance_m": max_distance_m,
-            "available_percent": route_available,
-            "reserved_percent": reserved,
+            "available_percent": available,
+            "reserved_percent": float(getattr(settings, "min_return_percent", 20.0) or 0.0),
             "base": [base.lon, base.lat] if base else None,
             "clamp_enabled": self._mission_state in (MissionState.IN_FLIGHT, MissionState.RTL),
         }
@@ -3022,16 +3515,6 @@ class AppController(QObject):
             self.routeBatteryChanged.emit()
             return
 
-        route_distance = 0.0
-        for a, b in zip(path[:-1], path[1:]):
-            route_distance += haversine_m(a, b)
-
-        end_lat, end_lon = path[-1]
-        return_leg = 0.0
-        if base is not None:
-            return_leg = haversine_m((end_lat, end_lon), (base.lat, base.lon))
-        total_distance = route_distance + return_leg
-
         if max_distance_m <= 0:
             self._route_battery_text = "Route: n/a"
             self._route_battery_remaining_text = "Remaining: n/a"
@@ -3039,10 +3522,18 @@ class AppController(QObject):
             self.routeBatteryChanged.emit()
             return
 
+        route_distance = 0.0
+        for a, b in zip(path[:-1], path[1:]):
+            route_distance += haversine_m(a, b)
         route_percent = (route_distance / max_distance_m) * 100.0
-        required_percent = (total_distance / max_distance_m) * 100.0
-        total_required = required_percent + reserved
-        remaining = available - total_required
+
+        summary = self._route_energy_summary(path, telemetry=telemetry)
+        required_percent = route_percent
+        remaining = available - route_percent
+        if summary is not None:
+            required_percent = float(summary.get("required_percent", route_percent) or route_percent)
+            reserved = float(summary.get("reserved_percent", 0.0) or 0.0)
+            remaining = float(summary.get("margin_percent", available - route_percent - reserved) or 0.0)
 
         if not self._link_monitor.is_link_ok():
             self._emit_warning(
@@ -3053,29 +3544,43 @@ class AppController(QObject):
             )
 
         if remaining < 0:
+            if not self._route_battery_warning:
+                self._emit_warning(
+                    key="route_energy_insufficient",
+                    message="Insufficient battery for return to home",
+                    severity="warn",
+                    cooldown_s=8,
+                )
             self._route_battery_warning = True
-            self._emit_warning(
-                key="route_energy_insufficient",
-                message="Insufficient battery for return to home",
-                severity="warn",
-                cooldown_s=8,
-            )
         else:
             self._route_battery_warning = False
 
-        remaining_display = max(0.0, 100.0 - route_percent)
-        self._route_battery_remaining_text = f"Remaining: {remaining_display:.1f}%"
-        self._route_battery_text = f"Route: {route_percent:.1f}%" if route_percent > 0 else "Route: --"
+        self._route_battery_remaining_text = f"Remaining after route+reserve: {remaining:.1f}%"
+        self._route_battery_text = (
+            f"Route+RTL: {required_percent:.1f}%"
+            if required_percent > 0
+            else (f"Route: {route_percent:.1f}%" if route_percent > 0 else "Route: --")
+        )
         self.routeBatteryChanged.emit()
 
-    def _orbit_targets(self, targets: list[ConfirmedObject], *, source: str = "manual") -> None:
+    def _orbit_targets(
+        self,
+        targets: list[ConfirmedObject],
+        *,
+        source: str = "manual",
+        allow_unsafe: bool = False,
+    ) -> None:
         if self._mission_state != MissionState.IN_FLIGHT:
             return
         if not self._commands_enabled:
             self.toastRequested.emit("Link lost; commands disabled")
             return
+        self._clear_orbit_battery_advisory()
         if not self._latest_telemetry:
             self.toastRequested.emit("No telemetry available for orbit")
+            return
+        if self._route_edit_mode:
+            self.toastRequested.emit("Apply or cancel route edit before orbit")
             return
         if not targets:
             self.toastRequested.emit("No confirmed objects available")
@@ -3104,6 +3609,33 @@ class AppController(QObject):
             return
         for target in valid_targets[1:]:
             self._queue_pending_orbit_target(target, source=source)
+        preview_targets: list[ConfirmedObject] = []
+        preview_target_ids: set[str] = set()
+        for target in valid_targets:
+            if target.object_id in preview_target_ids:
+                continue
+            preview_targets.append(target)
+            preview_target_ids.add(target.object_id)
+        for object_id, _queued_source in self._pending_orbit_queue:
+            queued_target = self._objects_store.get(object_id)
+            if queued_target is not None and queued_target.object_id not in preview_target_ids:
+                preview_targets.append(queued_target)
+                preview_target_ids.add(queued_target.object_id)
+        setattr(
+            deps,
+            "debug_orbit_targets",
+            [(float(target.lat), float(target.lon)) for target in preview_targets],
+        )
+        if self._latest_telemetry is not None:
+            setattr(
+                deps,
+                "debug_orbit_sequence",
+                [
+                    (float(self._latest_telemetry.lat), float(self._latest_telemetry.lon)),
+                    *[(float(target.lat), float(target.lon)) for target in preview_targets],
+                ],
+            )
+        advisory_targets = list(preview_targets)
         valid_targets = valid_targets[:1]
 
         base_path = self._mission.confirmed_plan or self._plan_vm.get_path()
@@ -3115,22 +3647,53 @@ class AppController(QObject):
             )
             return
         if self._latest_telemetry is not None and base_route.waypoints:
-            base_route.active_index = self._nearest_waypoint_index(
+            base_route.active_index = self._nearest_rejoin_segment_index(
                 float(self._latest_telemetry.lat),
                 float(self._latest_telemetry.lon),
                 base_route.waypoints,
             )
+        setattr(
+            deps,
+            "debug_orbit_preview_paths",
+            self._build_orbit_preview_paths(
+                targets=preview_targets,
+                current_state=self._latest_telemetry,
+                base_route=base_route,
+            ),
+        )
+        self._orbit_resume_route = base_route.model_copy(deep=True)
 
         state = self._latest_telemetry
-        rejoin_wp: Waypoint | None = None
         target = valid_targets[0]
         route = self._plan_vm._route_planner.plan_maneuver(
             current_state=state,
             target_lat=float(target.lat),
             target_lon=float(target.lon),
             base_route=base_route,
+            allow_unsafe=allow_unsafe,
+        )
+        unsafe_route = self._plan_vm._route_planner.plan_maneuver(
+            current_state=state,
+            target_lat=float(target.lat),
+            target_lon=float(target.lon),
+            base_route=base_route,
+            allow_unsafe=True,
         )
         if route is None:
+            if unsafe_route is not None and not allow_unsafe:
+                queued_targets = [target]
+                for object_id, _queued_source in self._pending_orbit_queue:
+                    queued_target = self._objects_store.get(object_id)
+                    if queued_target is not None:
+                        queued_targets.append(queued_target)
+                self._show_orbit_battery_advisory(
+                    targets=queued_targets,
+                    source=source,
+                    orbit_route=unsafe_route,
+                    base_route=base_route,
+                    target=target,
+                )
+                return
             self._emit_warning(
                 key="battery_orbit_insufficient",
                 message="Insufficient battery for orbit",
@@ -3142,47 +3705,36 @@ class AppController(QObject):
                 user_message="Orbit unavailable: energy/path check failed",
             )
             return
-        if not route.waypoints:
-            self._recover_from_failed_orbit_attempt(
-                reason=f"empty_route:{source}",
-                user_message="Orbit route unavailable",
+        advisory_route = route
+        if len(advisory_targets) > 1:
+            chain_route = self._build_orbit_chain_route(
+                targets=advisory_targets,
+                current_state=state,
+                base_route=base_route,
+            )
+            if chain_route is not None:
+                advisory_route = chain_route
+        if not allow_unsafe and self._orbit_requires_battery_prompt(advisory_route):
+            queued_targets = [target]
+            for object_id, _queued_source in self._pending_orbit_queue:
+                queued_target = self._objects_store.get(object_id)
+                if queued_target is not None:
+                    queued_targets.append(queued_target)
+            self._show_orbit_battery_advisory(
+                targets=queued_targets,
+                source=source,
+                orbit_route=advisory_route,
+                base_route=base_route,
+                target=target,
             )
             return
-        last_wp = route.waypoints[-1]
-        if base_route.waypoints:
-            rejoin_idx = self._nearest_waypoint_index(last_wp.lat, last_wp.lon, base_route.waypoints)
-            rejoin_wp = base_route.waypoints[rejoin_idx].model_copy(deep=True)
-
-        orbit_route = Route(version=1, waypoints=route.waypoints, active_index=0)
-        orbit_target = (float(target.lat), float(target.lon))
-        if self._backend == "unreal" and self._unreal_link is not None:
-            self._try_unreal_resume_before_route_send()
-            if not self._send_unreal_route(
-                orbit_route,
-                orbit_target=orbit_target,
-                orbit_target_alt=self._resolve_orbit_target_altitude_m(),
-            ):
-                self._recover_from_failed_orbit_attempt(
-                    reason=f"route_send_failed:{source}",
-                    user_message="Failed to send orbit to Unreal",
-                )
-                return
-
-        self._reaction_target_id = None
-        self._reaction_started_monotonic = 0.0
-        self._clear_reaction_slowdown()
-        self._orbit_active = True
-        self._orbit_rejoin_wp = rejoin_wp
-        self._orbit_rejoin_close_hits = 0
-        self._set_pending_orbit_targets(valid_targets)
-        self._activate_orbit_target_lock()
-        self._set_orbit_flow_state(OrbitFlowState.ORBIT_ACTIVE, reason=f"orbit_started:{source}")
-
-        deps.debug_target = {"lat": orbit_target[0], "lon": orbit_target[1]}
-        deps.debug_orbit_path = [(wp.lat, wp.lon) for wp in route.waypoints]
-        self._active_path.set_orbit(deps.debug_orbit_path)
-        self.map_bridge.render_map()
-        self.toastRequested.emit("Orbit route staged")
+        self._stage_orbit_route(
+            route=route,
+            base_route=base_route,
+            target=target,
+            active_targets=valid_targets,
+            source=source,
+        )
 
     def _nearest_waypoint_index(self, lat: float, lon: float, route: list[Waypoint]) -> int:
         nearest_idx = 0
@@ -3194,15 +3746,56 @@ class AppController(QObject):
                 nearest_idx = idx
         return nearest_idx
 
+    def _nearest_rejoin_segment_index(self, lat: float, lon: float, route: list[Waypoint]) -> int:
+        if len(route) < 2:
+            return 0
+
+        scale_lat = 111_320.0
+        scale_lon = 111_320.0 * math.cos(math.radians(float(lat)))
+
+        def _to_local(wp: Waypoint) -> tuple[float, float]:
+            return (
+                (float(wp.lon) - float(lon)) * scale_lon,
+                (float(wp.lat) - float(lat)) * scale_lat,
+            )
+
+        best_idx = 0
+        best_dist = float("inf")
+
+        for idx in range(len(route) - 1):
+            start_wp = route[idx]
+            end_wp = route[idx + 1]
+            sx, sy = _to_local(start_wp)
+            ex, ey = _to_local(end_wp)
+            dx = ex - sx
+            dy = ey - sy
+            seg_len_sq = dx * dx + dy * dy
+            if seg_len_sq <= 1e-6:
+                candidate = start_wp
+            else:
+                t = max(0.0, min(1.0, (-(sx * dx + sy * dy)) / seg_len_sq))
+                candidate = Waypoint(
+                    lat=float(start_wp.lat) + (float(end_wp.lat) - float(start_wp.lat)) * t,
+                    lon=float(start_wp.lon) + (float(end_wp.lon) - float(start_wp.lon)) * t,
+                    alt=float(start_wp.alt) + (float(end_wp.alt) - float(start_wp.alt)) * t,
+                )
+            dist = haversine_m((lat, lon), (candidate.lat, candidate.lon))
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+
+        return best_idx
+
     def _maybe_restore_route_after_orbit(self, sample: TelemetrySample) -> None:
         if not self._orbit_active:
             return
-        if self._orbit_rejoin_wp is None:
+        completion_wp = self._orbit_route_end_wp or self._orbit_rejoin_wp
+        if completion_wp is None:
             return
 
         dist_m = haversine_m(
             (float(sample.lat), float(sample.lon)),
-            (self._orbit_rejoin_wp.lat, self._orbit_rejoin_wp.lon),
+            (completion_wp.lat, completion_wp.lon),
         )
         if dist_m > self._orbit_rejoin_threshold_m:
             self._orbit_rejoin_close_hits = 0
@@ -3211,23 +3804,48 @@ class AppController(QObject):
         self._orbit_rejoin_close_hits += 1
         if self._orbit_rejoin_close_hits < 2:
             return
+        if self._orbit_started_monotonic > 0.0:
+            elapsed = time.monotonic() - self._orbit_started_monotonic
+            if elapsed < self._orbit_min_complete_time_s:
+                return
 
+        queued = self._pop_next_pending_orbit_target(sample)
+        next_target: ConfirmedObject | None = None
+        next_source: str | None = None
+        if queued is not None:
+            queued_target, queued_source = queued
+            if queued_source != "auto" or self._auto_orbit_enabled:
+                next_target = queued_target
+                next_source = queued_source
         self._mark_pending_orbit_targets_orbited()
         if self._backend == "unreal" and self._unreal_link is not None:
-            self._unreal_link.send_command("ORBIT_STOP")
-        self._clear_manual_orbit_state()
+            resume_route = self._orbit_resume_route
+            if next_target is None:
+                self._unreal_link.send_command("ORBIT_STOP")
+            if next_target is None:
+                resume_route = self._build_final_resume_route(sample) or resume_route
+            if next_target is None and resume_route is not None and resume_route.waypoints:
+                if not self._send_unreal_route(resume_route):
+                    self.toastRequested.emit("Orbit complete; failed to resume mission route")
+                    return
+        self._clear_manual_orbit_state(clear_preview=next_target is None)
         deps.debug_orbit_path = None
+        deps.debug_target = None
+        deps.selected_object_id = None
+        self._objects_store.set_selected(None)
+        self._on_objects_changed()
         self._active_path.set_normal()
-        self._set_orbit_flow_state(OrbitFlowState.ROUTE_RESUME, reason="orbit_rejoin_reached")
-        self._set_orbit_flow_state(OrbitFlowState.NORMAL_FLIGHT, reason="route_resume_complete")
-        self.map_bridge.render_map()
-        self.toastRequested.emit("Orbit complete; resumed mission route")
-
-        queued = self._dequeue_pending_orbit_targets()
-        if queued:
-            next_target, next_source = queued[0]
-            if next_source != "auto" or self._auto_orbit_enabled:
-                self._orbit_targets([next_target], source=f"queued_{next_source}")
+        if next_target is None:
+            self._set_orbit_flow_state(OrbitFlowState.ROUTE_RESUME, reason="orbit_rejoin_reached")
+            self._set_orbit_flow_state(OrbitFlowState.NORMAL_FLIGHT, reason="route_resume_complete")
+            self.map_bridge.render_map()
+        else:
+            self._set_orbit_flow_state(OrbitFlowState.NORMAL_FLIGHT, reason="orbit_chain_next_target")
+        if next_target is None:
+            self.toastRequested.emit("Orbit complete; resumed mission route")
+        else:
+            self.toastRequested.emit("Orbit complete; moving to next target")
+            self._orbit_targets([next_target], source=f"queued_{next_source}")
 
     def _try_unreal_resume_before_route_send(self) -> None:
         if self._backend != "unreal" or self._unreal_link is None:
@@ -3236,12 +3854,198 @@ class AppController(QObject):
             return
         self._unreal_link.send_command("CONTINUE")
 
-    def _clear_manual_orbit_state(self) -> None:
+    def _clear_manual_orbit_state(self, *, clear_preview: bool = True) -> None:
         self._orbit_active = False
         self._orbit_rejoin_wp = None
         self._orbit_rejoin_close_hits = 0
         self._orbit_target_track_ids = set()
         self._orbit_target_centers = []
+        self._orbit_route_end_wp = None
+        self._orbit_resume_route = None
+        self._orbit_resume_min_index = None
+        self._orbit_started_monotonic = 0.0
+        self._orbit_min_complete_time_s = 0.0
+        if clear_preview:
+            setattr(deps, "debug_orbit_targets", [])
+            setattr(deps, "debug_orbit_sequence", [])
+            setattr(deps, "debug_orbit_preview_paths", [])
+        self._restore_detector_after_orbit()
+
+    def _build_final_resume_route(self, sample: TelemetrySample) -> Route | None:
+        base_route = None
+        if self._orbit_resume_route is not None and self._orbit_resume_route.waypoints:
+            base_route = self._orbit_resume_route.model_copy(deep=True)
+        else:
+            base_path = self._mission.confirmed_plan or self._plan_vm.get_path()
+            base_route = self._route_from_points(base_path)
+        if base_route is None or not base_route.waypoints:
+            return None
+        if base_route.active_index is None:
+            base_route.active_index = self._nearest_rejoin_segment_index(
+                float(sample.lat),
+                float(sample.lon),
+                base_route.waypoints,
+            )
+        exit_wp = Waypoint(
+            lat=float(sample.lat),
+            lon=float(sample.lon),
+            alt=float(getattr(sample, "alt", self._latest_telemetry.alt if self._latest_telemetry else 120.0) or 120.0),
+        )
+        planner = getattr(self._plan_vm, "_route_planner", None)
+        rejoin_path: list[Waypoint] | None = None
+        try:
+            if planner is not None and hasattr(planner, "plan_rejoin"):
+                rejoin_path = planner.plan_rejoin(exit_wp, base_route)
+            else:
+                rejoin_path = build_rejoin(exit_wp, base_route)
+        except Exception:
+            _log.debug("Failed to build final orbit resume route", exc_info=True)
+            return None
+        if not rejoin_path:
+            return None
+        return Route(
+            version=base_route.version if base_route.version is not None else 1,
+            waypoints=list(rejoin_path),
+            active_index=0,
+        )
+
+    def _extract_orbit_segment(
+        self,
+        route: Route,
+        base_route: Route,
+    ) -> tuple[list[Waypoint], Waypoint | None]:
+        waypoints = list(route.waypoints or [])
+        if not waypoints:
+            return [], None
+
+        base_waypoints = list(base_route.waypoints or [])
+        start_idx = 0
+        if base_waypoints and base_route.active_index is not None:
+            start_idx = max(0, min(int(base_route.active_index), len(base_waypoints) - 1))
+
+        rejoin_start_idx: int | None = None
+        for base_idx in range(start_idx, len(base_waypoints)):
+            base_suffix = base_waypoints[base_idx:]
+            suffix_len = len(base_suffix)
+            if suffix_len <= 0 or suffix_len > len(waypoints):
+                continue
+            route_idx = len(waypoints) - suffix_len
+            route_suffix = waypoints[route_idx:]
+            if not all(self._same_waypoint(a, b) for a, b in zip(route_suffix, base_suffix)):
+                continue
+            if suffix_len == 1 and (
+                route_idx <= 0 or not self._same_waypoint(waypoints[route_idx - 1], waypoints[route_idx])
+            ):
+                continue
+            if route_idx == 0:
+                continue
+            if all(self._same_waypoint(a, b) for a, b in zip(route_suffix, base_suffix)):
+                rejoin_start_idx = route_idx
+                break
+
+        if rejoin_start_idx is None or rejoin_start_idx <= 0:
+            return waypoints, waypoints[-1]
+
+        orbit_segment = waypoints[:rejoin_start_idx]
+        return orbit_segment, orbit_segment[-1]
+
+    def _extract_resume_waypoint_index(self, route: Route, base_route: Route) -> int | None:
+        waypoints = list(route.waypoints or [])
+        base_waypoints = list(base_route.waypoints or [])
+        if not waypoints or not base_waypoints:
+            return None
+
+        start_idx = 0
+        if base_route.active_index is not None:
+            start_idx = max(0, min(int(base_route.active_index), len(base_waypoints) - 1))
+
+        for base_idx in range(start_idx, len(base_waypoints)):
+            base_suffix = base_waypoints[base_idx:]
+            suffix_len = len(base_suffix)
+            if suffix_len <= 0 or suffix_len > len(waypoints):
+                continue
+            route_idx = len(waypoints) - suffix_len
+            route_suffix = waypoints[route_idx:]
+            if all(self._same_waypoint(a, b) for a, b in zip(route_suffix, base_suffix)):
+                return base_idx
+        return None
+
+    def _build_orbit_preview_paths(
+        self,
+        *,
+        targets: list[ConfirmedObject],
+        current_state: TelemetrySample | None,
+        base_route: Route,
+    ) -> list[list[tuple[float, float]]]:
+        if current_state is None or not targets or not base_route.waypoints:
+            return []
+        planner = getattr(self._plan_vm, "_route_planner", None)
+        if planner is None or not hasattr(planner, "plan_maneuver"):
+            return []
+
+        preview_paths: list[list[tuple[float, float]]] = []
+        simulated_state = current_state.model_copy(deep=True)
+        for target in targets:
+            try:
+                route = planner.plan_maneuver(
+                    current_state=simulated_state,
+                    target_lat=float(target.lat),
+                    target_lon=float(target.lon),
+                    base_route=base_route,
+                    allow_unsafe=True,
+                )
+            except Exception:
+                _log.debug("Failed to build orbit preview path", exc_info=True)
+                break
+            if route is None or not route.waypoints:
+                simulated_state = self._telemetry_from_target(simulated_state, target)
+                continue
+
+            orbit_segment, orbit_completion_wp = self._extract_orbit_segment(route, base_route)
+            segment = orbit_segment or list(route.waypoints)
+            coords = dedupe_path([(float(wp.lat), float(wp.lon)) for wp in segment], threshold_m=0.5)
+            if len(coords) >= 2:
+                preview_paths.append(coords)
+
+            completion_wp = orbit_completion_wp or segment[-1]
+            simulated_state = self._telemetry_from_waypoint(simulated_state, completion_wp)
+        return preview_paths
+
+    def _telemetry_from_waypoint(self, sample: TelemetrySample, waypoint: Waypoint) -> TelemetrySample:
+        return sample.model_copy(
+            update={
+                "lat": float(waypoint.lat),
+                "lon": float(waypoint.lon),
+                "alt": float(waypoint.alt),
+                "timestamp": utc_now(),
+            }
+        )
+
+    def _telemetry_from_target(self, sample: TelemetrySample, target: ConfirmedObject) -> TelemetrySample:
+        return sample.model_copy(
+            update={
+                "lat": float(target.lat),
+                "lon": float(target.lon),
+                "timestamp": utc_now(),
+            }
+        )
+
+    def _estimate_orbit_min_complete_time_s(self, orbit_segment: list[Waypoint]) -> float:
+        if len(orbit_segment) < 2:
+            return 0.0
+        distance_m = 0.0
+        for a, b in zip(orbit_segment, orbit_segment[1:]):
+            distance_m += haversine_m((float(a.lat), float(a.lon)), (float(b.lat), float(b.lon)))
+        cruise_speed = max(0.5, float(getattr(settings, "cruise_speed_mps", 12.0) or 12.0))
+        # Require most of the orbit segment to be flown before allowing route resume.
+        return max(3.0, (distance_m / cruise_speed) * 0.6)
+
+    @staticmethod
+    def _same_waypoint(a: Waypoint, b: Waypoint) -> bool:
+        return (
+            haversine_m((float(a.lat), float(a.lon)), (float(b.lat), float(b.lon))) <= 0.5
+            and abs(float(a.alt) - float(b.alt)) <= 0.5
+        )
 
     def _set_pending_orbit_targets(self, targets: list[ConfirmedObject]) -> None:
         self._orbit_target_track_ids = set()
@@ -3251,6 +4055,27 @@ class AppController(QObject):
             if tid is not None:
                 self._orbit_target_track_ids.add(tid)
             self._orbit_target_centers.append((float(target.lat), float(target.lon)))
+
+    def _order_targets_for_orbit(self, targets: list[ConfirmedObject]) -> list[ConfirmedObject]:
+        if len(targets) <= 1:
+            return list(targets)
+        remaining = list(targets)
+        ordered: list[ConfirmedObject] = []
+        telemetry = self._latest_telemetry
+        if telemetry is not None:
+            current = (float(telemetry.lat), float(telemetry.lon))
+        else:
+            first = remaining[0]
+            current = (float(first.lat), float(first.lon))
+        while remaining:
+            next_target = min(
+                remaining,
+                key=lambda target: haversine_m(current, (float(target.lat), float(target.lon))),
+            )
+            ordered.append(next_target)
+            remaining.remove(next_target)
+            current = (float(next_target.lat), float(next_target.lon))
+        return ordered
 
     def _activate_orbit_target_lock(self) -> None:
         for track_id in self._orbit_target_track_ids:
@@ -3270,6 +4095,49 @@ class AppController(QObject):
             if tid is not None:
                 self._target_tracker.mark_orbited(tid)
             self._target_tracker.add_suppression_zone(lat=float(target.lat), lon=float(target.lon))
+
+    def _apply_detector_pause_for_orbit(self) -> None:
+        if not self._detector_running:
+            return
+        self.stopDetector()
+        self._detector_forced_paused_by_orbit = True
+
+    def _restore_detector_after_orbit(self) -> None:
+        if not self._detector_forced_paused_by_orbit:
+            return
+        if self._detector_running:
+            self._detector_forced_paused_by_orbit = False
+            return
+        self.startDetector()
+        self._detector_forced_paused_by_orbit = False
+
+    def _should_suppress_orbit_duplicate(self, lat: float, lon: float, *, class_id: int) -> bool:
+        if class_id != 1:
+            return False
+        if not self._orbit_target_centers:
+            return False
+        for center in self._orbit_target_centers:
+            if haversine_m(center, (lat, lon)) <= 20.0:
+                return True
+        return False
+
+    def _stash_recoverable_mission(self) -> None:
+        path = list(self._mission.confirmed_plan or self._plan_vm.get_path() or [])
+        if len(path) < 2:
+            return
+        home = getattr(deps, "home_location", None)
+        snapshot = RecoverableMissionSnapshot(
+            path=[(float(lat), float(lon)) for lat, lon in path],
+            home=(
+                {"lat": float(home["lat"]), "lon": float(home["lon"])}
+                if isinstance(home, dict) and home.get("lat") is not None and home.get("lon") is not None
+                else None
+            ),
+            confirmed_objects=[dict(item) for item in getattr(deps, "confirmed_objects", []) or []],
+            selected_object_id=str(getattr(deps, "selected_object_id", "") or "") or None,
+        )
+        self._recoverable_mission = snapshot
+        self.recoverableMissionChanged.emit()
 
     @staticmethod
     def _coerce_track_id(value: object) -> int | None:
@@ -3292,12 +4160,44 @@ class AppController(QObject):
         self._unreal_local_telemetry_by_frame_id.clear()
         self._unreal_local_frame_order.clear()
         deps.selected_object_id = None
+        setattr(deps, "debug_orbit_targets", [])
+        setattr(deps, "debug_orbit_sequence", [])
+        setattr(deps, "debug_orbit_preview_paths", [])
 
     def _handle_battery(self, sample: TelemetrySample) -> None:
         if self._mission_state not in (MissionState.IN_FLIGHT, MissionState.READY):
             return
         if self._rtl_forced:
             return
+        suppress_runtime_route_check = (
+            self._mission_state == MissionState.IN_FLIGHT and self._within_unreal_route_send_grace()
+        )
+        remaining_route = (
+            self._build_remaining_active_route(sample)
+            if self._mission_state == MissionState.IN_FLIGHT and not suppress_runtime_route_check
+            else None
+        )
+        if remaining_route is not None:
+            base_path = list(self._mission.confirmed_plan or self._plan_vm.get_path() or [])
+            mission_base_route = self._route_from_points(base_path) or remaining_route
+            estimate = self._estimate_route_energy(
+                remaining_route,
+                telemetry=sample,
+                base_route=mission_base_route,
+            )
+            if estimate is not None and not estimate.can_complete:
+                self._rtl_forced = True
+                self._emit_warning(
+                    key="battery_route_runtime_insufficient",
+                    message="Battery is no longer sufficient for the remaining route; forcing return-to-home",
+                    severity="error",
+                    cooldown_s=8,
+                )
+                self._initiate_rtl(
+                    reason="battery_runtime_insufficient",
+                    user_message="Remaining route is unsafe; returning home",
+                )
+                return
         try:
             critical = self._energy_model.is_critical(sample)
         except Exception:
@@ -3313,15 +4213,17 @@ class AppController(QObject):
             cooldown_s=10,
         )
         if self._mission_state == MissionState.IN_FLIGHT:
-            self._send_rtl_route()
-            self._mission.trigger_rtl("battery_critical")
+            self._initiate_rtl(reason="battery_critical", user_message="Critical battery; returning home")
 
     def _handle_mission_progress_from_telemetry(self, sample: TelemetrySample) -> None:
         mode = str(getattr(sample, "flight_mode", None) or getattr(sample, "status", None) or "").upper()
         if not mode:
             return
         if mode == "WAITING_FOR_ROUTE":
+            if self._ignore_transient_unreal_waiting_for_route():
+                return
             if self._mission_state != MissionState.PREFLIGHT:
+                self._stash_recoverable_mission()
                 self._mission.abort_to_preflight("sim_waiting_for_route")
             return
         if mode not in ("MISSION_COMPLETE", "ROUTE_COMPLETE", "COMPLETED"):
@@ -3339,20 +4241,174 @@ class AppController(QObject):
         route = self._route_from_points(pts)
         if route is None:
             return True
-        base = self._resolve_base_location(route, self._latest_telemetry)
-        if base is None:
-            return True
-        try:
-            estimate = self._energy_model.estimate_route_feasibility(self._latest_telemetry, route, base)
-        except Exception:
+        estimate = self._estimate_route_energy(route)
+        if estimate is None:
             return True
         return bool(estimate.can_complete)
 
+    def _estimate_route_energy(
+        self,
+        route: Route,
+        telemetry: TelemetrySample | None = None,
+        *,
+        base_route: Route | None = None,
+    ):
+        sample = telemetry or self._latest_telemetry
+        if sample is None:
+            return None
+        base = self._resolve_base_location(base_route or route, sample)
+        if base is None:
+            return None
+        try:
+            return self._energy_model.estimate_route_feasibility(sample, route, base)
+        except Exception:
+            return None
+
+    def _orbit_requires_battery_prompt(self, route: Route) -> bool:
+        estimate = self._estimate_route_energy(route)
+        if estimate is None:
+            return False
+        low_margin_percent = float(getattr(settings, "orbit_low_margin_percent", 5.0) or 5.0)
+        if not estimate.can_complete:
+            return True
+        return estimate.margin_percent <= low_margin_percent
+
+    def _build_orbit_chain_route(
+        self,
+        *,
+        targets: list[ConfirmedObject],
+        current_state: TelemetrySample,
+        base_route: Route,
+    ) -> Route | None:
+        planner = getattr(self._plan_vm, "_route_planner", None)
+        if planner is None or not targets:
+            return None
+        current_sample = current_state.model_copy(deep=True)
+        chain_waypoints: list[Waypoint] = []
+        for target in targets:
+            route = planner.plan_maneuver(
+                current_state=current_sample,
+                target_lat=float(target.lat),
+                target_lon=float(target.lon),
+                base_route=base_route,
+                allow_unsafe=True,
+            )
+            if route is None or not route.waypoints:
+                return None
+            segment = [wp.model_copy(deep=True) for wp in route.waypoints]
+            if chain_waypoints and segment:
+                segment = segment[1:]
+            chain_waypoints.extend(segment)
+            last_wp = route.waypoints[-1]
+            current_sample = current_sample.model_copy(
+                update={"lat": last_wp.lat, "lon": last_wp.lon, "alt": last_wp.alt}
+            )
+        return Route(
+            version=base_route.version or 1,
+            waypoints=chain_waypoints,
+            active_index=0 if chain_waypoints else None,
+        )
+
+    def _show_orbit_battery_advisory(
+        self,
+        *,
+        targets: list[ConfirmedObject],
+        source: str,
+        orbit_route: Route,
+        base_route: Route,
+        target: ConfirmedObject,
+    ) -> None:
+        estimate = self._estimate_route_energy(orbit_route)
+        rtl_available = self._rtl_route_available()
+        self._pending_orbit_battery_targets = list(targets)
+        self._pending_orbit_battery_source = source
+        self._pending_orbit_advisory_route = orbit_route.model_copy(deep=True)
+        self._pending_orbit_advisory_base_route = base_route.model_copy(deep=True)
+        self._pending_orbit_advisory_target = target
+        self._orbit_battery_rtl_available = rtl_available
+        self._orbit_battery_advisory_visible = True
+        if estimate is not None:
+            self._orbit_battery_advisory_text = (
+                "Orbit may not be completed safely. "
+                f"Need about {estimate.required_percent:.1f}% plus reserve; "
+                f"margin {estimate.margin_percent:.1f}%."
+            )
+        else:
+            self._orbit_battery_advisory_text = (
+                "Orbit may not be completed safely with current battery."
+            )
+        self.orbitBatteryAdvisoryChanged.emit()
+
+    def _stage_orbit_route(
+        self,
+        *,
+        route: Route,
+        base_route: Route,
+        target: ConfirmedObject,
+        active_targets: list[ConfirmedObject],
+        source: str,
+    ) -> None:
+        if not route.waypoints:
+            self._recover_from_failed_orbit_attempt(
+                reason=f"empty_route:{source}",
+                user_message="Orbit route unavailable",
+            )
+            return
+        rejoin_wp: Waypoint | None = None
+        last_wp = route.waypoints[-1]
+        if base_route.waypoints:
+            rejoin_idx = self._nearest_waypoint_index(last_wp.lat, last_wp.lon, base_route.waypoints)
+            rejoin_wp = base_route.waypoints[rejoin_idx].model_copy(deep=True)
+
+        orbit_segment, orbit_completion_wp = self._extract_orbit_segment(route, base_route)
+        self._orbit_resume_min_index = self._extract_resume_waypoint_index(route, base_route)
+        if self._orbit_resume_min_index is not None and base_route.waypoints:
+            rejoin_wp = base_route.waypoints[self._orbit_resume_min_index].model_copy(deep=True)
+        if not orbit_segment:
+            orbit_segment = list(route.waypoints)
+        orbit_route = Route(version=1, waypoints=list(orbit_segment), active_index=0)
+        orbit_target = (float(target.lat), float(target.lon))
+        if self._backend == "unreal" and self._unreal_link is not None:
+            self._try_unreal_resume_before_route_send()
+            if not self._send_unreal_route(
+                orbit_route,
+                orbit_target=orbit_target,
+                orbit_target_alt=self._resolve_orbit_target_altitude_m(),
+            ):
+                self._recover_from_failed_orbit_attempt(
+                    reason=f"route_send_failed:{source}",
+                    user_message="Failed to send orbit to Unreal",
+                )
+                return
+
+        self._reaction_target_id = None
+        self._reaction_started_monotonic = 0.0
+        self._clear_reaction_slowdown()
+        self._orbit_active = True
+        self._orbit_rejoin_wp = rejoin_wp
+        self._orbit_route_end_wp = (
+            orbit_completion_wp.model_copy(deep=True) if orbit_completion_wp is not None else None
+        )
+        self._orbit_started_monotonic = time.monotonic()
+        self._orbit_min_complete_time_s = self._estimate_orbit_min_complete_time_s(orbit_segment)
+        self._orbit_rejoin_close_hits = 0
+        self._set_pending_orbit_targets(active_targets)
+        self._activate_orbit_target_lock()
+        self._apply_detector_pause_for_orbit()
+        self._set_orbit_flow_state(OrbitFlowState.ORBIT_ACTIVE, reason=f"orbit_started:{source}")
+
+        deps.debug_target = {"lat": orbit_target[0], "lon": orbit_target[1]}
+        deps.debug_orbit_path = [(wp.lat, wp.lon) for wp in orbit_segment]
+        self._active_path.set_orbit(deps.debug_orbit_path)
+        self.map_bridge.render_map()
+        self.toastRequested.emit("Orbit route staged")
+
     def _route_from_points(self, pts: list[tuple[float, float]]) -> Route | None:
-        if len(pts) < 2:
+        clean_pts = dedupe_path(pts)
+        if len(clean_pts) < 2:
             return None
         alt = self._latest_telemetry.alt if self._latest_telemetry else 120.0
-        waypoints = [Waypoint(lat=lat, lon=lon, alt=alt) for lat, lon in pts]
+        waypoints = [Waypoint(lat=lat, lon=lon, alt=alt) for lat, lon in clean_pts]
         return Route(version=1, waypoints=waypoints, active_index=0)
 
     def _resolve_max_distance_m(self) -> float:
@@ -3375,25 +4431,9 @@ class AppController(QObject):
         return (battery_wh / power_w) * cruise_speed * 3600.0
 
     def _resolve_base_location(self, route: Route, telemetry: TelemetrySample) -> WorldCoord | None:
-        for lat_key, lon_key in (("home_lat", "home_lon"), ("base_lat", "base_lon")):
-            lat = getattr(settings, lat_key, None)
-            lon = getattr(settings, lon_key, None)
-            if lat is not None and lon is not None:
-                try:
-                    return WorldCoord(lat=float(lat), lon=float(lon))
-                except (TypeError, ValueError):
-                    pass
-        if route.waypoints:
-            wp = route.waypoints[0]
-            return WorldCoord(lat=wp.lat, lon=wp.lon)
-        if math.isfinite(float(telemetry.lat)) and math.isfinite(float(telemetry.lon)):
-            return WorldCoord(lat=telemetry.lat, lon=telemetry.lon)
-        center = getattr(settings, "map_center", None)
-        if isinstance(center, (list, tuple)) and len(center) >= 2:
-            try:
-                return WorldCoord(lat=float(center[0]), lon=float(center[1]))
-            except (TypeError, ValueError):
-                pass
+        resolved = resolve_base_location(settings, route, telemetry)
+        if resolved is not None:
+            return resolved
         return WorldCoord(lat=telemetry.lat, lon=telemetry.lon)
 
     def _resolve_uav_id(self, sample: TelemetrySample) -> str:
@@ -3402,15 +4442,60 @@ class AppController(QObject):
             return str(source)
         return str(getattr(settings, "uav_id", None) or "uav")
 
+    def _build_remaining_active_route(self, sample: TelemetrySample) -> Route | None:
+        path = self._active_path.get_active_path()
+        if len(path) < 2:
+            return None
+        remaining_points = list(path)
+        if self._active_path.mode != ActivePathMode.ORBIT:
+            nearest_idx = self._nearest_waypoint_index(
+                float(sample.lat),
+                float(sample.lon),
+                [Waypoint(lat=lat, lon=lon, alt=float(sample.alt)) for lat, lon in path],
+            )
+            remaining_points = path[nearest_idx:]
+        waypoints = [Waypoint(lat=float(sample.lat), lon=float(sample.lon), alt=float(sample.alt))]
+        for lat, lon in remaining_points:
+            waypoints.append(Waypoint(lat=lat, lon=lon, alt=float(sample.alt)))
+        return Route(version=1, waypoints=waypoints, active_index=0 if waypoints else None)
+
     def _send_rtl_route(self) -> bool:
         route = self._build_rtl_route()
         if route is None:
             return False
+        if self._backend == "unreal" and self._unreal_link is not None:
+            if self._orbit_active:
+                self._unreal_link.send_command("ORBIT_STOP")
+            if not self._send_unreal_route(route):
+                return False
         self._rtl_route_sent = True
         deps.rtl_path = [(wp.lat, wp.lon) for wp in route.waypoints]
         deps.debug_orbit_path = None
-        self._active_path.set_rtl(deps.rtl_path)
+        if hasattr(self._active_path, "set_rtl"):
+            self._active_path.set_rtl(deps.rtl_path)
         self.map_bridge.render_map()
+        return True
+
+    def _initiate_rtl(self, *, reason: str, user_message: str) -> bool:
+        self._clear_route_battery_advisory()
+        self._clear_orbit_battery_advisory()
+        self._pending_orbit_queue = []
+        self._pending_orbit_ids.clear()
+        if self._orbit_active:
+            self._clear_manual_orbit_state()
+        deps.debug_orbit_path = None
+        deps.debug_target = None
+        deps.selected_object_id = None
+        self._objects_store.set_selected(None)
+        self._on_objects_changed()
+        if not self._send_rtl_route():
+            self.toastRequested.emit("Failed to send RTL route")
+            return False
+        trigger_rtl = getattr(self._mission, "trigger_rtl", None)
+        if callable(trigger_rtl):
+            trigger_rtl(reason)
+        self.flightControlsChanged.emit()
+        self.toastRequested.emit(user_message)
         return True
 
     def _send_unreal_despawn(self) -> bool:
@@ -3418,13 +4503,17 @@ class AppController(QObject):
             return False
         return self._unreal_link.send_command("DESPAWN")
 
-    def _build_rtl_route(self) -> Route | None:
+    def _build_rtl_route(self, *, silent: bool = False) -> Route | None:
         if self._latest_telemetry is None:
-            self.toastRequested.emit("No telemetry available for RTL")
+            if not silent:
+                self.toastRequested.emit("No telemetry available for RTL")
             return None
-        base = self._resolve_base_location(Route(version=1, waypoints=[], active_index=None), self._latest_telemetry)
+        base_path = list(self._mission.confirmed_plan or self._plan_vm.get_path() or [])
+        base_route = self._route_from_points(base_path) or Route(version=1, waypoints=[], active_index=None)
+        base = self._resolve_base_location(base_route, self._latest_telemetry)
         if base is None:
-            self.toastRequested.emit("Home location unavailable")
+            if not silent:
+                self.toastRequested.emit("Home location unavailable")
             return None
         alt = self._latest_telemetry.alt
         waypoints = [
@@ -3530,14 +4619,15 @@ class AppController(QObject):
         if log_now:
             self._last_detection_log_ts = now
             self._last_detection_sig = sig
-        payload = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "count": len(detections),
-            "best_confidence": round(float(best_conf), 4),
-            "best_bbox": list(bbox) if bbox else None,
-            "classes": classes,
-            "detections": [self._serialize_detection(d) for d in detections],
-        }
+        payload = make_raw_detection_log_entry(
+            timestamp=utc_iso_z(),
+            count=len(detections),
+            best_confidence=round(float(best_conf), 4),
+            best_bbox=list(bbox) if bbox else None,
+            classes=classes,
+            detections=[self._serialize_detection(d) for d in detections],
+            telemetry=self._latest_telemetry,
+        )
         if log_now:
             _log.warning(
                 "Detection | count=%d best=%.2f classes=%s bbox=%s",
@@ -3581,6 +4671,16 @@ class AppController(QObject):
         except Exception:  # noqa: BLE001
             _log.exception("Failed to write detection JSON")
 
+    def _write_confirmed_detection_json(self, payload: dict[str, object]) -> None:
+        try:
+            entry = make_confirmed_detection_log_entry(payload, telemetry=self._latest_telemetry)
+            self._confirmed_det_json_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._confirmed_det_json_path.open("a", encoding="utf-8") as fh:
+                json.dump(entry, fh, ensure_ascii=False, default=str)
+                fh.write("\n")
+        except Exception:  # noqa: BLE001
+            _log.exception("Failed to write confirmed detection JSON")
+
 
 # --------------------------------------------------------------------------- #
 #                               MainWindow facade
@@ -3588,7 +4688,7 @@ class AppController(QObject):
 class MainWindow(QObject):
     """QML-driven UI facade that keeps the existing lifecycle wiring."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, qml_file: str = "main.qml") -> None:
         super().__init__()
         self.det_vm = DetectorVM()
         self.plan_vm = PlannerVM()
@@ -3712,7 +4812,7 @@ class MainWindow(QObject):
         self._engine.addImageProvider("video", self._video_provider)
         self._engine.rootContext().setContextProperty("app", self.app)
 
-        qml_path = Path(__file__).resolve().parents[1] / "qml" / "main.qml"
+        qml_path = Path(__file__).resolve().parents[1] / "qml" / qml_file
         _log.info("Loading QML UI from %s", qml_path)
         self._engine.load(QUrl.fromLocalFile(str(qml_path)))
         if not self._engine.rootObjects():

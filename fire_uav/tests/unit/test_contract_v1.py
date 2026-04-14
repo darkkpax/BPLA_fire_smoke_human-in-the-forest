@@ -15,12 +15,13 @@ from fire_uav.module_core.contract.mappers import (
 )
 from fire_uav.module_core.contract.v1 import CapabilitiesV1, TelemetryV1
 from fire_uav.module_core.schema import Route, Waypoint
+from fire_uav.utils.time import utc_now
 
 
 def test_telemetry_v1_requires_min_fields() -> None:
     payload = {
         "uav_id": "uav-1",
-        "timestamp": datetime.utcnow(),
+        "timestamp": utc_now(),
         "lat": 56.0,
         "lon": 92.9,
         "alt": 120.0,
@@ -29,13 +30,13 @@ def test_telemetry_v1_requires_min_fields() -> None:
     assert msg.protocol_version == 1
 
     with pytest.raises(ValidationError):
-        TelemetryV1(lat=56.0, lon=92.9, alt=120.0, timestamp=datetime.utcnow())
+        TelemetryV1(lat=56.0, lon=92.9, alt=120.0, timestamp=utc_now())
 
 
 def test_telemetry_mapping_roundtrip() -> None:
     msg = TelemetryV1(
         uav_id="uav-2",
-        timestamp=datetime.utcnow(),
+        timestamp=utc_now(),
         lat=55.0,
         lon=90.0,
         alt=100.0,

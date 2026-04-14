@@ -6,6 +6,7 @@ from enum import StrEnum
 from typing import Iterable
 
 from fire_uav.module_core.geometry import haversine_m
+from fire_uav.utils.time import utc_now
 
 
 class TargetTrackState(StrEnum):
@@ -80,7 +81,7 @@ class TargetTracker:
     def update(self, observations: Iterable[TargetObservation]) -> list[TrackUpdate]:
         obs_list = list(observations)
         if not obs_list:
-            self._cleanup(datetime.utcnow())
+            self._cleanup(utc_now())
             return []
 
         now = max(obs.timestamp for obs in obs_list)
@@ -127,7 +128,7 @@ class TargetTracker:
         return out
 
     def mark_orbited(self, track_id: int, *, now: datetime | None = None) -> bool:
-        ts = now or datetime.utcnow()
+        ts = now or utc_now()
         self._cleanup(ts)
         track = self._tracks.get(int(track_id))
         if track is None:
@@ -137,7 +138,7 @@ class TargetTracker:
         return True
 
     def mark_in_orbit(self, track_id: int, *, now: datetime | None = None) -> bool:
-        ts = now or datetime.utcnow()
+        ts = now or utc_now()
         self._cleanup(ts)
         track = self._tracks.get(int(track_id))
         if track is None:
@@ -147,7 +148,7 @@ class TargetTracker:
         return True
 
     def add_suppression_zone(self, *, lat: float, lon: float, now: datetime | None = None) -> None:
-        ts = now or datetime.utcnow()
+        ts = now or utc_now()
         self._cleanup(ts)
         self._zones.append(
             _SuppressionZone(
@@ -159,7 +160,7 @@ class TargetTracker:
         )
 
     def is_suppressed(self, lat: float, lon: float, *, now: datetime | None = None) -> bool:
-        ts = now or datetime.utcnow()
+        ts = now or utc_now()
         self._cleanup(ts)
         return self._is_suppressed_no_cleanup(float(lat), float(lon))
 

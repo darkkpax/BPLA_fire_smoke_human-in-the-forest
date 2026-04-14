@@ -23,12 +23,12 @@ class Settings:
     driver_type: str = ""
     mavlink_connection_string: str = "udp:127.0.0.1:14550"
     unreal_base_url: str = "http://127.0.0.1:9000"
-    unreal_video_mode: str = "jpeg_snapshots"
+    unreal_video_mode: str = "h264_stream"
     unreal_video_endpoint: str = "/sim/v1/video.ts"
-    unreal_video_target_fps: float = 20.0
+    unreal_video_target_fps: float = 60.0
     unreal_video_reconnect_s: float = 1.0
-    unreal_camera_hz: float = 8.0
-    unreal_telemetry_hz: float = 6.0
+    unreal_camera_hz: float = 60.0
+    unreal_telemetry_hz: float = 60.0
     unreal_detections_hz: float = 1.0
     unreal_detection_source: str = "local_yolo"
     unreal_local_detect_hz: float = 5.0
@@ -41,16 +41,16 @@ class Settings:
     use_ortools: bool = True
     uav_id: str | None = None
     notifications_dir: Path = Path("data/notifications")
-    bbox_smooth_alpha: float = 0.5
-    bbox_smooth_max_dist_px: float = 80.0
+    bbox_smooth_alpha: float = 0.25
+    bbox_smooth_max_dist_px: float = 60.0
     track_iou_threshold: float = 0.25
     track_max_age_seconds: float = 2.0
     track_min_hits: int = 2
     track_max_missed: int = 10
     track_max_center_distance_px: float = 80.0
-    visualizer_enabled: bool = False
+    visualizer_enabled: bool = True
     visualizer_url: str = "http://127.0.0.1:8000"
-    log_level: str = "INFO"
+    log_level: str = "WARNING"
     log_to_file: bool = False
     log_file: Path = Path("data/logs/fire_uav.log")
     log_max_bytes: int = 5_000_000
@@ -63,10 +63,10 @@ class Settings:
     watchdog_expect_detections: bool = False
 
     # Параметры YOLO
-    yolo_model: str = "yolov11n.pt"
-    yolo_conf: float = 0.4
+    yolo_model: str = "data/models/best_yolo11.pt"
+    yolo_conf: float = 0.15
     yolo_iou: float = 0.45
-    yolo_classes: List[int] = field(default_factory=lambda: [0, 1, 2])
+    yolo_classes: List[int] = field(default_factory=lambda: [0, 1])
 
     # Общие пути
     output_root: Path = Path("data/outputs")
@@ -78,13 +78,16 @@ class Settings:
     ground_station_enabled: bool = False
 
     # Агрегация по кадрам / телеметрия
-    agg_window: int = 5
-    agg_votes_required: int = 3
-    agg_min_confidence: float = 0.6
-    agg_max_distance_m: float = 35.0
+    agg_window: int = 3
+    agg_votes_required: int = 1
+    agg_min_confidence: float = 0.4
+    agg_max_distance_m: float = 60.0
     agg_ttl_seconds: float = 8.0
-    match_radius_m: float = 30.0
-    suppression_radius_m: float = 60.0
+    dedup_bbox_center_distance_px: float = 120.0
+    dedup_geo_distance_m: float = 45.0
+    match_radius_m: float = 35.0
+    object_registry_match_radius_m: float = 45.0
+    suppression_radius_m: float = 30.0
     suppression_ttl_s: float = 180.0
     stable_frames_n: int = 1
 
@@ -92,7 +95,11 @@ class Settings:
     map_provider: str = "openlayers_de"
     static_map_image_path: str | None = None
     static_map_bounds: dict | None = None
-    map_center: list[float] | None = None
+    map_center: list[float] | None = field(default_factory=lambda: [56.02, 92.9])
+    home_lat: float | None = None
+    home_lon: float | None = None
+    base_lat: float | None = None
+    base_lon: float | None = None
     gsd_cm: float = 3.0
     side_overlap: float = 0.7
     front_overlap: float = 0.8
@@ -101,9 +108,11 @@ class Settings:
     orbit_points_per_circle: int = 12
     orbit_loops: int = 1
     maneuver_alt_m: float | None = None
-    battery_wh: float = 4500.0
+    cruise_speed_mps: float = 12.0
+    power_cruise_w: float = 45.0
+    battery_wh: float = 77.0
     no_fly_geojson: str = "data/no_fly_zones.geojson"
-    max_flight_distance_m: float = 15000.0
+    max_flight_distance_m: float = 0.0
     min_return_percent: float = 20.0
     critical_battery_percent: float = 10.0
 
@@ -217,7 +226,16 @@ class Settings:
             agg_min_confidence=float(data.get("agg_min_confidence", defaults.agg_min_confidence)),
             agg_max_distance_m=float(data.get("agg_max_distance_m", defaults.agg_max_distance_m)),
             agg_ttl_seconds=float(data.get("agg_ttl_seconds", defaults.agg_ttl_seconds)),
+            dedup_bbox_center_distance_px=float(
+                data.get("dedup_bbox_center_distance_px", defaults.dedup_bbox_center_distance_px)
+            ),
+            dedup_geo_distance_m=float(
+                data.get("dedup_geo_distance_m", defaults.dedup_geo_distance_m)
+            ),
             match_radius_m=float(data.get("match_radius_m", defaults.match_radius_m)),
+            object_registry_match_radius_m=float(
+                data.get("object_registry_match_radius_m", defaults.object_registry_match_radius_m)
+            ),
             suppression_radius_m=float(
                 data.get("suppression_radius_m", defaults.suppression_radius_m)
             ),
@@ -227,6 +245,18 @@ class Settings:
             static_map_image_path=data.get("static_map_image_path", defaults.static_map_image_path),
             static_map_bounds=static_bounds,
             map_center=data.get("map_center", defaults.map_center),
+            home_lat=(
+                None if data.get("home_lat", defaults.home_lat) is None else float(data.get("home_lat"))
+            ),
+            home_lon=(
+                None if data.get("home_lon", defaults.home_lon) is None else float(data.get("home_lon"))
+            ),
+            base_lat=(
+                None if data.get("base_lat", defaults.base_lat) is None else float(data.get("base_lat"))
+            ),
+            base_lon=(
+                None if data.get("base_lon", defaults.base_lon) is None else float(data.get("base_lon"))
+            ),
             gsd_cm=float(data.get("gsd_cm", defaults.gsd_cm)),
             side_overlap=float(data.get("side_overlap", defaults.side_overlap)),
             front_overlap=float(data.get("front_overlap", defaults.front_overlap)),
@@ -241,6 +271,8 @@ class Settings:
                 if data.get("maneuver_alt_m", defaults.maneuver_alt_m) is None
                 else float(data.get("maneuver_alt_m"))
             ),
+            cruise_speed_mps=float(data.get("cruise_speed_mps", defaults.cruise_speed_mps)),
+            power_cruise_w=float(data.get("power_cruise_w", defaults.power_cruise_w)),
             battery_wh=float(data.get("battery_wh", defaults.battery_wh)),
             no_fly_geojson=str(data.get("no_fly_geojson", defaults.no_fly_geojson)),
             max_flight_distance_m=float(
